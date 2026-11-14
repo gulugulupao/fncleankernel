@@ -1,0 +1,14 @@
+#!/bin/bash
+# fncleankernel 命令行入口（也可从 SSH 直接运行，沿用手动清理习惯）
+#   kclean scan      只读扫描，输出 JSON
+#   kclean dry-run   预演清理计划，不改动系统
+#   kclean clean     执行清理；无论结果如何都会强制 sudo update-grub
+APP="${TRIM_APPDEST:-/vol1/@appcenter/fncleankernel}"
+ENGINE="$APP/bin/kernel_clean.py"
+PY="${KC_PYTHON:-/usr/bin/python3}"
+case "${1:-scan}" in
+    scan|"")  exec "$PY" "$ENGINE" --scan ;;
+    dry-run)  exec "$PY" "$ENGINE" --dry-run ;;
+    clean)    exec "$PY" "$ENGINE" --clean ;;
+    *)        echo "usage: kclean {scan|dry-run|clean}" >&2; exit 1 ;;
+esac

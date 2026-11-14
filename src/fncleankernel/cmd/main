@@ -1,0 +1,58 @@
+#!/bin/bash
+# fncleankernel 生命周期：start / stop / status
+# 后端复用宿主 Python3（设备实测 3.11.2），零 Docker、零第三方依赖。
+set +e
+APP="${TRIM_APPDEST:-/vol1/@appcenter/fncleankernel}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fncleankernel}"
+PORT="${SERVICE_PORT:-8097}"
+WEB="$APP/web/server.py"
+LOG="$VAR/log"
+RUN="$VAR/run"
+PID="$RUN/web.pid"
+PY="${KC_PYTHON:-/usr/bin/python3}"
+
+mkdir -p "$LOG" "$RUN" 2>/dev/null
+
+wait_tcp () {
+    local port="$1" tries="$2" i=0
+    while [ $i -lt "$tries" ]; do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            exec 3>&- 3<&- 2>/dev/null
+            return 0
+        fi
+        sleep 1
+        i=$((i+1))
+    done
+    return 1
+}
+
+do_start () {
+    if [ -f "$PID" ] && kill -0 "$(cat "$PID" 2>/dev/null)" 2>/dev/null; then
+        if wait_tcp "$PORT" 2; then exit 0; fi
+    fi
+    rm -f "$PID"
+    nohup env SERVICE_PORT="$PORT" TRIM_APPDEST="$APP" TRIM_PKGVAR="$VAR" \
+        "$PY" "$WEB" >"$LOG/web.log" 2>&1 &
+    echo $! > "$PID"
+    # 给 checkport 健康检查留窗口（对齐 fnOS 原生应用惯例）
+    wait_tcp "$PORT" 12
+    exit 0
+}
+
+do_stop () {
+    [ -f "$PID" ] && kill "$(cat "$PID" 2>/dev/null)" 2>/dev/null
+    pkill -f "$APP/web/server.py" 2>/dev/null
+    rm -f "$PID"
+    exit 0
+}
+
+is_running () {
+    [ -f "$PID" ] && kill -0 "$(cat "$PID" 2>/dev/null)" 2>/dev/null
+}
+
+case "$1" in
+    start)  do_start ;;
+    stop)   do_stop ;;
+    status) is_running && exit 0 || exit 3 ;;
+    *)      echo "usage: $0 {start|stop|status}" >&2; exit 1 ;;
+esac

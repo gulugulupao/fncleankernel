@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>系统盘清理助手 · fnOS ARM</title>
+<link rel="stylesheet" href="style.css?v=9">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hd">
+    <div class="hd-left">
+      <div class="logo logo-img" aria-hidden="true"></div>
+      <div>
+        <h1>系统盘清理助手</h1>
+        <p class="sub">通用 ARM 飞牛 · 清旧内核、清系统盘缓存，给板载 EMMC 腾空间</p>
+      </div>
+    </div>
+    <div class="hd-right">
+      <span class="pill" id="pill-status">正在扫描</span>
+      <button class="btn btn-ghost" id="btn-scan">重新扫描</button>
+    </div>
+  </header>
+
+  <section class="devbar" id="devbar">
+    <span>设备信息读取中…</span>
+  </section>
+
+  <section class="banner" id="ssh-banner" hidden>
+    <strong>SSH 未开启</strong>
+    <span id="ssh-banner-text">请在 飞牛 OS「设置 → 终端/SSH」中手动开启 SSH，以便清理异常时能从电脑远程进入设备排障。清理本身不依赖 SSH。</span>
+  </section>
+
+  <section class="cards">
+    <div class="card stat">
+      <div class="stat-label">系统盘 / 可用</div>
+      <div class="stat-val" id="s-root">—</div>
+      <div class="stat-foot">板载 EMMC</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-label">/boot 可用</div>
+      <div class="stat-val" id="s-boot">—</div>
+      <div class="stat-foot">引导分区</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-label">当前运行内核</div>
+      <div class="stat-val stat-kernel" id="s-kernel">—</div>
+      <div class="stat-foot" id="s-latest">最新版本 —</div>
+    </div>
+    <div class="card stat">
+      <div class="stat-label">更新前建议线</div>
+      <div class="stat-val" id="s-safe">—</div>
+      <div class="stat-foot" id="s-safe-foot">实测峰值 1.11 GB</div>
+    </div>
+  </section>
+
+  <!-- ===== 系统盘体检 ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>系统盘体检</h2>
+      <span class="hint">先看清楚空间被谁占了，再决定清什么</span>
+    </div>
+    <div class="bar-label" id="bar-label">空间构成读取中…</div>
+    <div class="stackbar" id="breakdown-bar"><div class="empty">扫描中…</div></div>
+    <div class="legend" id="breakdown-legend"></div>
+    <div class="precheck">
+      <div class="precheck-hd">
+        <strong>更新前预检</strong>
+        <span class="pill" id="precheck-pill">检查中</span>
+      </div>
+      <div id="precheck-list" class="checklist"></div>
+      <details class="precheck-note-fold" id="precheck-note-fold">
+        <summary>阈值依据（真机实测）</summary>
+        <div class="precheck-note" id="precheck-note"></div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ===== 清理项（核心操作常驻） ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>清理项</h2>
+      <span class="hint">逐项勾选 · 只作用于板载 EMMC 系统盘，不动数据卷</span>
+    </div>
+    <div class="empty-banner" id="empty-banner" hidden></div>
+    <div class="cachelist" id="cachelist">
+      <div class="empty">扫描中…</div>
+    </div>
+    <details class="readonly-fold" id="readonly-fold" hidden>
+      <summary>体检详情（只读，不产生清理）</summary>
+      <div id="readonly-list"></div>
+    </details>
+    <div class="cache-total" id="cache-total">—</div>
+    <div class="cronfix" id="cronfix" hidden>
+      <div class="cronfix-txt" id="cronfix-txt"></div>
+      <button class="btn btn-ghost" id="btn-cron-fix" type="button">堵住邮件源头</button>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-clean" disabled>一键清理选中项</button>
+      <span class="action-note" id="action-note">请确认勾选项后执行</span>
+    </div>
+  </section>
+
+  <section class="card" id="result-card" hidden>
+    <div class="card-hd">
+      <h2>执行结果</h2>
+      <span class="hint" id="r-time"></span>
+    </div>
+    <div class="result-head" id="r-head">
+      <div class="result-title" id="r-title">—</div>
+      <div class="result-desc" id="r-desc"></div>
+    </div>
+    <div class="grubbox" id="r-grub">
+      <strong>update-grub</strong><span id="r-grub-text">—</span>
+    </div>
+    <div class="warnlist" id="r-warn"></div>
+    <div class="spacecmp" id="r-space"></div>
+    <div class="cachebox" id="r-cache"></div>
+    <details class="logbox">
+      <summary>查看完整执行日志</summary>
+      <pre id="r-log"></pre>
+    </details>
+  </section>
+
+  <!-- ===== 方案 C：详情类信息默认折叠 ===== -->
+  <details class="fold-card" id="fold-kernels">
+    <summary>已安装内核</summary>
+    <section class="card fold-inner">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>包名</th><th>版本</th><th>标记</th><th>锁定</th><th>占用</th><th>处理</th></tr>
+          </thead>
+          <tbody id="kbody"><tr><td colspan="6" class="empty">扫描中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="plan" id="plan">尚未生成清理计划。</div>
+    </section>
+  </details>
+
+  <details class="fold-card" id="fold-history">
+    <summary>历史记录</summary>
+    <section class="card fold-inner">
+      <div class="history-chart" id="history-chart"><div class="empty">读取中…</div></div>
+      <div class="history-summary" id="history-summary">—</div>
+      <div class="lastbox" id="last-result">上次执行结果读取中…</div>
+      <div class="actions">
+        <button class="btn btn-ghost" id="btn-load-log" type="button">查看完整运行日志</button>
+        <button class="btn btn-ghost" id="btn-copy-diag" type="button">复制诊断信息</button>
+      </div>
+      <details class="logbox" id="log-details" hidden>
+        <summary>运行日志</summary>
+        <pre id="full-log"></pre>
+      </details>
+    </section>
+  </details>
+
+  <details class="fold-card" id="fold-volumes">
+    <summary>存储空间（只读体检）</summary>
+    <section class="card fold-inner">
+      <div id="volume-list" class="volumelist"><div class="empty">读取中…</div></div>
+    </section>
+  </details>
+
+  <details class="fold-card" id="fold-boot">
+    <summary>引导链路</summary>
+    <section class="card fold-inner bootcard">
+      <div id="bootinfo" class="bootinfo">—</div>
+    </section>
+  </details>
+
+  <footer class="aboutline" aria-label="作者信息">
+    <span class="who">系统盘清理助手 v1.3.2</span>
+    <span>作者：<b>很多问题的小明同学</b></span>
+    <span id="qrTrigger" class="qr-trigger" role="button" tabindex="0"
+          title="点击查看公众号二维码">公众号：<b>很多问题的小明同学</b></span>
+    <span>与飞牛官方无关 · 开源 MIT + 附加保护条款</span>
+  </footer>
+</div>
+
+<!-- 公众号二维码灯箱（照搬 FnSmartdisk 原版交互） -->
+<div class="qr-modal hidden" id="qrModal" role="dialog" aria-modal="true" aria-label="公众号二维码">
+  <div class="qr-backdrop" id="qrBackdrop"></div>
+  <div class="qr-box">
+    <button class="qr-close" id="qrClose" aria-label="关闭" type="button">&times;</button>
+    <img src="images/wechat-promo.png" alt="微信公众号：很多问题的小明同学 二维码">
+    <div class="qr-caption">微信搜一搜：<b>很多问题的小明同学</b>　·　扫码即可关注</div>
+  </div>
+</div>
+
+<!-- cron 堵源二次确认弹窗 -->
+<div class="qr-modal hidden" id="cronModal" role="dialog" aria-modal="true" aria-label="修改定时任务确认">
+  <div class="qr-backdrop" id="cronBackdrop"></div>
+  <div class="qr-box confirm-box">
+    <button class="qr-close" id="cronClose" aria-label="关闭" type="button">&times;</button>
+    <h3>修改定时任务的邮件输出</h3>
+    <p>下面这些定时任务每分钟执行一次，产生的输出会被系统当成邮件投递，攒成了几十 MB 的邮件。此操作会给它们补上输出重定向，<b>不会删除任务本身</b>。</p>
+    <pre id="cron-rows"></pre>
+    <p>改之前会把原始配置备份一份，其它定时任务一行都不动。<b>这是你自己的应用配置，请确认后再执行。</b></p>
+    <div class="confirm-actions">
+      <button class="btn btn-ghost" id="cronCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="cronConfirm" type="button">确认修改</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=9"></script>
+</body>
+</html>

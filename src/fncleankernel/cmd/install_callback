@@ -1,0 +1,16 @@
+#!/bin/bash
+# 安装完成回调：补执行权限、准备数据目录、注册命令行入口
+set +e
+APP="${TRIM_APPDEST:-/vol1/@appcenter/fncleankernel}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fncleankernel}"
+
+mkdir -p "$VAR/log" "$VAR/run" 2>/dev/null
+chmod +x "$APP/cmd/"* 2>/dev/null
+chmod +x "$APP/bin/kclean" "$APP/bin/kernel_clean.py" "$APP/web/server.py" 2>/dev/null
+chmod -R a+rX "$APP/web" "$APP/ui" 2>/dev/null
+
+# 命令行入口，方便沿用 SSH 手动清理习惯：kclean scan / dry-run / clean
+ln -sf "$APP/bin/kclean" /usr/local/bin/kclean 2>/dev/null
+
+echo "[fncleankernel] installed; web=$APP/web/server.py" >> "$VAR/log/install.log" 2>&1
+exit 0

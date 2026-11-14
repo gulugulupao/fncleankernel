@@ -1,0 +1,240 @@
+# -*- coding: utf-8 -*-
+"""
+fncleankernel 错误分支单元测试（进程内 monkeypatch，不改动系统）
+逐项验证：状态分类、提示文案、以及「无论清理结果如何都执行 update-grub」铁律。
+"""
+import importlib.util
+import json
+import os
+import sys
+
+APP = '/vol1/@appcenter/fncleankernel'
+spec = importlib.util.spec_from_file_location('kc', APP + '/bin/kernel_clean.py')
+kc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(kc)
+
+# 隔离状态文件，避免污染真实 last_result.json
+kc.VAR = '/vol1/face_mon/fpk_build/testvar'
+kc.LOGDIR = kc.VAR + '/log'
+kc.STATE = kc.VAR + '/last_result.json'
+kc.LOGFILE = kc.LOGDIR + '/clean.log'
+os.makedirs(kc.LOGDIR, exist_ok=True)
+
+CUR = '6.18.18.c1196-trim'
+CUR_PKG = 'linux-image-' + CUR
+OLD = '6.18.18.c1145-trim'
+OLD_PKG = 'linux-image-' + OLD
+
+
+def collect(**over):
+    d = dict(
+        cur=CUR, cur_pkg=CUR_PKG, latest_pkg=CUR_PKG,
+        keep_pkgs=[CUR_PKG], keep_versions=[CUR], meta=['linux-image-arm64'],
+        candidates=[OLD_PKG],
+        purge=[OLD_PKG, 'linux-headers-' + OLD],
+        rows=[], hold_installed=[OLD_PKG], hold_to_unlock=[OLD_PKG],
+        selections={OLD_PKG: 'hold', CUR_PKG: 'install'},
+        imgs={CUR_PKG: {}, OLD_PKG: {}}, hdrs={}, mods={},
+        extra_packages=['linux-headers-' + OLD])
+    d.update(over)
+    return d
+
+
+def boot(**over):
+    d = dict(real='u-boot + extlinux', detail='', boot_kernel='vmlinuz-' + CUR,
+             boot_kernel_path='/boot/vmlinuz-' + CUR, boot_kernel_ok=True,
+             boot_version=CUR, boot_version_parsed=True, boot_on_old=False,
+             grub_cfg=True, update_grub='/usr/sbin/update-grub')
+    d.update(over)
+    return d
+
+
+def fake_sh_factory(sim_rc=0, sim_out=None, unhold_rc=0, purge_rc=0):
+    if sim_out is None:
+        sim_out = ('Reading package lists...\nPurg %s [%s]\n'
+                   'Purg linux-headers-%s [%s]\n' % (OLD_PKG, OLD, OLD, OLD))
+
+    def _sh(cmd, timeout=600):
+        c = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        if 'apt-get -s purge' in c:
+            return sim_rc, sim_out, ''
+        if 'apt-mark unhold' in c:
+            return unhold_rc, '', '' if unhold_rc == 0 else 'E: hold'
+        if 'apt-get purge -y' in c:
+            return purge_rc, 'removed', '' if purge_rc == 0 else 'E: purge failed'
+        if 'apt-mark hold' in c:
+            return 0, '', ''
+        return 0, '', ''
+    return _sh
+
+
+def setup(case):
+    """返回 (kwargs, expected_status, expect_warning_substr, grub_rc)"""
+    kw = dict(sim_rc=0, unhold_rc=0, purge_rc=0,
+              collect_over={}, boot_over={}, ssh_ok=True,
+              avail_kb=1600000, grub_rc=0)
+    exp = 'OK'
+    warn = None
+    if case == 'NO_OLD_KERNEL':
+        kw['collect_over'] = dict(candidates=[], purge=[], hold_installed=[],
+                                  hold_to_unlock=[], extra_packages=[])
+        exp = 'NO_OLD_KERNEL'
+    elif case == 'HOLD_UNLOCK_FAILED':
+        kw['unhold_rc'] = 1
+        exp = 'HOLD_UNLOCK_FAILED'
+        warn = '解锁失败'
+    elif case == 'UNSAFE_PLAN_SIM':
+        kw['sim_out'] = ('Purg %s [%s]\nPurg %s [%s]\n'
+                         % (OLD_PKG, OLD, CUR_PKG, CUR))
+        exp = 'UNSAFE_PLAN'
+        warn = '预演将删除保留包'
+    elif case == 'UNSAFE_PLAN_BOOT':
+        kw['boot_over'] = dict(boot_on_old=True, boot_version=OLD)
+        exp = 'UNSAFE_PLAN'
+        warn = '实际引导'
+    elif case == 'UNSAFE_PLAN_NOBOOT':
+        kw['boot_over'] = dict(boot_kernel_ok=False)
+        exp = 'UNSAFE_PLAN'
+        warn = '内核文件不存在'
+    elif case == 'PURGE_FAILED':
+        kw['purge_rc'] = 100
+        exp = 'PURGE_FAILED'
+        warn = 'PURGE_FAILED'
+    elif case == 'GRUB_FAILED':
+        kw['grub_rc'] = 1
+        exp = 'GRUB_FAILED'
+        warn = 'GRUB_FAILED'
+    elif case == 'LOW_SPACE':
+        kw['avail_kb'] = 300 * 1024
+        exp = 'OK'
+        warn = 'LOW_SPACE'
+    elif case == 'SSH_DISABLED':
+        kw['ssh_ok'] = False
+        exp = 'OK'
+        warn = 'SSH_DISABLED'
+    elif case == 'ENGINE_EXCEPTION':
+        exp = 'ERROR'
+    return kw, exp, warn
+
+
+CASES = ['OK', 'NO_OLD_KERNEL', 'HOLD_UNLOCK_FAILED', 'UNSAFE_PLAN_SIM',
+         'UNSAFE_PLAN_BOOT', 'UNSAFE_PLAN_NOBOOT', 'PURGE_FAILED',
+         'GRUB_FAILED', 'LOW_SPACE', 'SSH_DISABLED', 'ENGINE_EXCEPTION']
+
+
+def run_case(case):
+    kw, exp, warn = setup(case)
+    kc.collect = (lambda: (_ for _ in ()).throw(RuntimeError('inject'))) \
+        if case == 'ENGINE_EXCEPTION' else (lambda: collect(**kw['collect_over']))
+    kc.host_info = lambda: dict(hostname='TEST', kernel=CUR, arch='arm64',
+                                fnos='1.2.1000', soc='rk3566', board='')
+    kc.ssh_info = lambda: dict(active=kw['ssh_ok'], enabled=kw['ssh_ok'],
+                               port22=kw['ssh_ok'], ok=kw['ssh_ok'],
+                               hint='' if kw['ssh_ok'] else
+                               'SSH 未开启：请手动开启 SSH。')
+    kc.bootloader_info = lambda kv: boot(**kw['boot_over'])
+    kc.avail_kb = lambda p: kw['avail_kb']
+    kc.sh = fake_sh_factory(kw['sim_rc'], None if kw['sim_rc'] == 0 and
+                            case != 'UNSAFE_PLAN_SIM' else
+                            ('Purg %s [%s]\nPurg %s [%s]\n'
+                             % (OLD_PKG, OLD, CUR_PKG, CUR)),
+                            kw['unhold_rc'], kw['purge_rc'])
+    kc.selections = lambda: collect(**kw['collect_over'])['selections']
+    kc.dpkg_installed = lambda p: {}
+    kc.run_update_grub = lambda: (kw['grub_rc'], 'fake grub ok' if
+                                  kw['grub_rc'] == 0 else 'grub: fatal')
+    R = kc.do_clean(dry=False)
+    wtext = ' | '.join(R.get('warnings', []))
+    ok_status = (R['status'] == exp)
+    ok_warn = (warn is None) or (warn in wtext)
+    ok_grub = (R['grub']['executed'] is True and
+               R['grub']['rc'] == kw['grub_rc'])
+    return dict(case=case, status=R['status'], expect=exp,
+                status_ok=ok_status, warn_ok=ok_warn,
+                grub_executed=R['grub']['executed'], grub_rc=R['grub']['rc'],
+                grub_ok=ok_grub,
+                warnings=R.get('warnings', [])[:3])
+
+
+def cache_only_check():
+    """缓存-only 路径：不勾 old_kernel 时必须跳过 update-grub。"""
+    kc.collect = lambda: collect(candidates=[], purge=[], hold_installed=[],
+                                  hold_to_unlock=[], extra_packages=[])
+    kc.host_info = lambda: dict(hostname='TEST', kernel=CUR, arch='arm64',
+                                fnos='1.2.1000', soc='rk3566', board='',
+                                model_name='', model_id='', compat_items=[])
+    kc.ssh_info = lambda: dict(active=True, enabled=True, port22=True,
+                               ok=True, hint='')
+    kc.bootloader_info = lambda kv: boot()
+    kc.avail_kb = lambda p: 1600000
+    kc.cache_scan = lambda: [dict(
+        id='apt_cache', name='apt 缓存', desc='测试用', bytes=1024,
+        size_str='1.0 KB', label='可回收', count=1, available=True,
+        actionable=True, risk='low', default=True)]
+    kc.cache_clean = lambda R, ids: None
+    kc.sh = fake_sh_factory()
+    kc.run_update_grub = lambda: (0, 'SHOULD_NOT_RUN_FOR_CACHE_ONLY')
+    kc.selections = lambda: {}
+    kc.dpkg_installed = lambda p: {}
+    R = kc.do_clean(dry=False, items=['apt_cache'])
+    return dict(status=R['status'], executed=R['grub']['executed'],
+                rc=R['grub']['rc'], note=R['grub'].get('note', ''))
+
+
+def main():
+    rows = []
+    for c in CASES:
+        try:
+            rows.append(run_case(c))
+        except Exception as e:
+            rows.append(dict(case=c, status='TEST_CRASH:' + repr(e),
+                             expect='', status_ok=False, warn_ok=False,
+                             grub_executed=None, grub_rc=None,
+                             grub_ok=False, warnings=[]))
+    # dry-run 单独验证
+    kc.collect = lambda: collect()
+    kc.sh = fake_sh_factory()
+    kc.run_update_grub = lambda: (0, 'ok')
+    kc.selections = lambda: {}
+    kc.dpkg_installed = lambda p: {}
+    D = kc.do_clean(dry=True)
+    dry = dict(case='DRY_RUN', status=D['status'], expect='SCAN',
+               status_ok=D['status'] == 'SCAN', warn_ok=True,
+               grub_executed=D['grub']['executed'],
+               grub_rc=D['grub']['rc'],
+               grub_ok=D['grub']['executed'] is False, warnings=[])
+
+    print('%-22s %-22s %-6s %-6s %-8s %s' %
+          ('CASE', 'STATUS', 'STAT', 'WARN', 'GRUB', 'GRUB_RC'))
+    for r in rows:
+        print('%-22s %-22s %-6s %-6s %-8s %s' %
+              (r['case'], r['status'], 'PASS' if r['status_ok'] else 'FAIL',
+               'PASS' if r['warn_ok'] else 'FAIL',
+               'PASS' if r['grub_ok'] else 'FAIL', r['grub_rc']))
+    print('%-22s %-22s %-6s %-6s %-8s %s' %
+          (dry['case'], dry['status'], 'PASS' if dry['status_ok'] else 'FAIL',
+           '-', 'PASS' if dry['grub_ok'] else 'FAIL', 'not executed'))
+    print()
+    print('=== WARNINGS SAMPLE ===')
+    for r in rows:
+        if r['warnings']:
+            print(r['case'], '->', ' || '.join(r['warnings'])[:300])
+    passed = sum(1 for r in rows if r['status_ok'] and r['warn_ok'] and r['grub_ok'])
+    print()
+    print('RESULT: %d/%d branches passed (+dry-run %s)' %
+          (passed, len(rows), 'PASS' if dry['status_ok'] and dry['grub_ok'] else 'FAIL'))
+    print('IRON LAW: all kernel-touching branches executed update-grub =',
+          all(r['grub_executed'] is True for r in rows))
+    try:
+        co = cache_only_check()
+        co_ok = (co['executed'] is False and co['rc'] is None and
+                 '已跳过' in co['note'])
+        print('CACHE_ONLY: status=%s grub_executed=%s note=%s -> %s' %
+              (co['status'], co['executed'], co['note'][:44],
+               'PASS' if co_ok else 'FAIL'))
+    except Exception as e:
+        print('CACHE_ONLY: TEST_CRASH %r -> FAIL' % (e,))
+
+
+if __name__ == '__main__':
+    main()

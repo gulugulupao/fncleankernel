@@ -1,0 +1,10 @@
+#!/bin/bash
+# 卸载回调：停掉 Web 服务、移除命令行软链（不触碰系统内核与引导配置）
+set +e
+APP="${TRIM_APPDEST:-/vol1/@appcenter/fncleankernel}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fncleankernel}"
+[ -f "$VAR/run/web.pid" ] && kill "$(cat "$VAR/run/web.pid" 2>/dev/null)" 2>/dev/null
+pkill -f "$APP/web/server.py" 2>/dev/null
+rm -f "$VAR/run/web.pid"
+if [ -L /usr/local/bin/kclean ]; then rm -f /usr/local/bin/kclean; fi
+exit 0

@@ -1,0 +1,19 @@
+# ===== fncleankernel 仓库白名单：只提交交付物，排除所有开发/验证残留 =====
+# 默认忽略根目录下的所有条目，再显式放通需要版本化的内容。
+*
+!.gitignore
+!README.md
+!LICENSE.txt
+!使用说明.md
+!fncleankernel.fpk
+!build_fpk.py
+!test_branches.py
+!src/
+!src/**
+
+# src 目录整体放通，但去掉编译缓存
+**/__pycache__/
+*.pyc
+
+# 本地构建/部署脚本可能带本机绝对路径，不进库；如需协同开发再放通
+# （本仓库仅交付源码 + 构建产物，build_fpk.py 已含通用构建逻辑）

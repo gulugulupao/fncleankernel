@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "fncleankernel.Application": {
+            "title": "系统盘清理助手",
+            "icon": "images/icon_{0}.png",
+            "type": "url",
+            "protocol": "http",
+            "port": "8097",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}

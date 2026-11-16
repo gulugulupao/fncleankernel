@@ -13,7 +13,23 @@ USER = '浪里小白龙'
 HOSTS = [('OEC', '192.168.110.171'), ('OES', '192.168.110.10')]
 BASE = r'E:\WorkBuddy产物\2026-11-02-23-07-59\旧内核清理fpk'
 LOCAL = os.path.join(BASE, 'src', 'fncleankernel')
-OUT = os.path.join(BASE, 'fncleankernel.fpk')
+
+
+def manifest_version():
+    """从 manifest 读取 version，用于给 fpk 文件名加版本号（每个版本都备注）。"""
+    try:
+        with open(os.path.join(LOCAL, 'manifest'), 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip().startswith('version'):
+                    return line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return ''
+
+
+VER = manifest_version()
+FPK_NAME = 'fncleankernel-V%s.fpk' % VER if VER else 'fncleankernel.fpk'
+OUT = os.path.join(BASE, FPK_NAME)
 RR = '/vol1/face_mon/fpk_build'
 REMOTE = RR + '/fncleankernel'
 RVAR = RR + '/var'
@@ -132,7 +148,7 @@ def build(c, sftp):
             if p.endswith('.fpk'):
                 path = p
     if not path:
-        path = RR + '/fncleankernel.fpk'
+        path = RR + '/' + FPK_NAME
     return path
 
 

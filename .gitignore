@@ -5,7 +5,7 @@
 !README.md
 !LICENSE.txt
 !使用说明.md
-!fncleankernel.fpk
+!fncleankernel-V*.fpk
 !build_fpk.py
 !test_branches.py
 !src/

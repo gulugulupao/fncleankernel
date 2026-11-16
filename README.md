@@ -39,7 +39,7 @@
 
 ## 安装
 
-1. 下载仓库里的 `fncleankernel.fpk`（或到 [Releases](https://github.com/gulugulupao/fncleankernel/releases) 取最新版）。
+1. 下载仓库里的 `fncleankernel-V1.3.2.fpk`（或到 [Releases](https://github.com/gulugulupao/fncleankernel/releases) 取最新版）。安装包文件名带版本号，方便区分不同版本。
 2. 飞牛桌面「应用中心」→ 右上角「手动安装」→ 选择该文件。
 3. 装好后点「系统盘清理助手」打开，手机浏览器也能用（页面自动排成窄屏版式）。
 
@@ -49,7 +49,7 @@
 
 ```
 src/fncleankernel/   应用源码（fpk 工程）：引擎 kernel_clean.py、Web 后端 server.py、前端、图标、脚本、manifest
-fncleankernel.fpk    构建好的安装包（与 Releases 中一致）
+fncleankernel-V1.3.2.fpk  构建好的安装包（文件名含版本号，与 Releases 中一致）
 build_fpk.py         构建/部署脚本（上传工程 → 设备只读验证 → 设备上 fnpack build → 回传核验）
 test_branches.py     错误分支单元测试（进程内 monkeypatch，覆盖状态分类 + update-grub 铁律）
 使用说明.md           面向用户的使用说明

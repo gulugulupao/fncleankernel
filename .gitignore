@@ -8,6 +8,8 @@
 !fncleankernel-V*.fpk
 !build_fpk.py
 !test_branches.py
+!screenshots/
+!screenshots/**
 !src/
 !src/**
 

@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""fncleankernel Web 后端：零第三方依赖，复用宿主 Python3。"""
+"""fncleankernel Web 后端：零第三方依赖，复用宿主 Python3。
+
+v1.5.5 安全加固（B 档）：
+  S1 Host 白名单 —— 挡 DNS rebinding（Origin/Host 只互相比较不足以证明可信）
+  S2 GET /api/scan 节流 + 独立锁 —— 挡跨站 <img> 触发的重子进程 DoS；支持 ?force=1
+  S3 跨站 GET 一律拒绝（Sec-Fetch-Site）—— cron_source / 日志不再被外部网页拉取
+  S4 请求体上限 + 连接超时 + 写接口统一串行锁
+  保持用户已拍板的基线：默认 0.0.0.0 无认证、不改绑、不加登录。
+"""
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -23,12 +34,52 @@ PORT = int(os.environ.get('SERVICE_PORT') or
 # 应用打不开；可用 FNCLEAN_BIND=127.0.0.1 切换为仅本机可连（会牺牲直连入口）。
 BIND = os.environ.get('FNCLEAN_BIND') or '0.0.0.0'
 
-BUSY = threading.Lock()
+BUSY = threading.Lock()          # 所有写操作（clean / fix-cron）共用，串行化
+SCAN_BUSY = threading.Lock()     # scan 独立锁，避免并发起多个重引擎进程
+SCAN_TTL = 20                    # 秒；无 force 的 scan 在窗口内复用上次结果
+_SCAN_CACHE = {'at': 0.0, 'data': None}
+MAX_BODY = 64 * 1024
+CONN_TIMEOUT = 15
 MIME = {'.html': 'text/html; charset=utf-8',
         '.css': 'text/css; charset=utf-8',
         '.js': 'application/javascript; charset=utf-8',
         '.png': 'image/png',
         '.json': 'application/json; charset=utf-8'}
+
+# S1：可信主机集合。本机名 / 本机所有 IP / 回环，外加 FNCLEAN_ALLOWED_HOSTS
+# 环境变量（逗号分隔，供 DDNS 域名等自定义入口使用）。
+_ALLOWED_HOSTS_EXTRA = set(
+    x.strip().lower() for x in
+    os.environ.get('FNCLEAN_ALLOWED_HOSTS', '').split(',') if x.strip())
+
+
+def _local_hosts():
+    names = {'localhost', '127.0.0.1', '::1', '[::1]'}
+    try:
+        names.add(socket.gethostname().lower())
+    except Exception:
+        pass
+    try:
+        names.add(socket.getfqdn().lower())
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            names.add(info[4][0].split('%')[0].lower())
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        names.add(s.getsockname()[0].lower())
+        s.close()
+    except Exception:
+        pass
+    names.update(_ALLOWED_HOSTS_EXTRA)
+    return names
+
+
+LOCAL_HOSTS = _local_hosts()
 
 # 清理项白名单：前端传来的 items 只认这几个，其余静默丢弃
 ALLOWED_ITEMS = {'old_kernel', 'apt_cache', 'syslog_rotated',
@@ -83,31 +134,88 @@ def _host_of(value):
     return v.split(':')[0].lower()
 
 
+def _trusted_host(value):
+    """S1：Host/Origin 必须是本机名、本机 IP、回环，或显式配置的域名。
+
+    DNS rebinding 让 evil.example 解析到 NAS 内网 IP，浏览器发出的
+    Origin/Host 都是 evil.example —— 只比较两者相等会放行；这里改为
+    与「可信集合」比对。IP 字面量一律放行（避免枚举不到多网卡地址时
+    误挡正常入口），带名称的主机必须在集合内。"""
+    h = _host_of(value)
+    if not h:
+        return True
+    if h in LOCAL_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(h)      # IP 字面量：放行
+        return True
+    except ValueError:
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        # S4：每条连接设超时，Slowloris 变体无法长期占住线程
+        try:
+            self.connection.settimeout(CONN_TIMEOUT)
+        except Exception:
+            pass
+        BaseHTTPRequestHandler.setup(self)
+
     def log_message(self, fmt, *args):
         return
 
     def _write_allowed(self):
-        """写接口同源校验（纵深防御，不依赖 Host/Origin 严格相等以兼容各种入口）。
+        """写接口校验（纵深防御，不依赖 Host/Origin 严格相等以兼容各种入口）。
 
         1) 自定义头：跨站 <form> 无法携带；跨站 fetch 带自定义头会先发 CORS
            预检，本服务未实现 OPTIONS，浏览器不会发出实际请求。
         2) Sec-Fetch-Site：浏览器明确标记跨站时直接拒绝。
-        3) Origin 主机名比对：仅在浏览器未标记 same-origin 时启用，
-           避免误挡经由代理进入的请求。
+        3) Host / Origin 与可信主机集合比对（S1，挡 DNS rebinding）。
         """
         if (self.headers.get('X-Fnclean-Client') or '') != 'web':
             return False, '缺少同源标记（X-Fnclean-Client）'
         sec = (self.headers.get('Sec-Fetch-Site') or '').lower()
         if sec and sec not in ('same-origin', 'none'):
             return False, '跨站请求被拒绝（Sec-Fetch-Site=%s）' % sec
+        host = self.headers.get('Host') or ''
+        if host and not _trusted_host(host):
+            return False, 'Host 不在允许列表'
         origin = self.headers.get('Origin')
-        if origin and sec != 'same-origin':
-            oh = _host_of(origin)
-            hh = _host_of(self.headers.get('Host') or '')
-            if oh and hh and oh != hh:
-                return False, 'Origin 与 Host 不一致'
+        if origin:
+            if not _trusted_host(origin):
+                return False, 'Origin 不在允许列表'
+            if sec != 'same-origin':
+                oh = _host_of(origin)
+                hh = _host_of(host)
+                if oh and hh and oh != hh:
+                    return False, 'Origin 与 Host 不一致'
         return True, ''
+
+    def _get_allowed(self):
+        """S3：跨站 GET 一律拒绝。
+
+        <img src="http://NAS:8097/api/scan"> 会带 Sec-Fetch-Site: cross-site，
+        据此挡掉外部网页对 /api/scan、/api/log、cron_source 的探测与副作用。
+        本机脚本 / curl 不发送该头，仍按已接受的「直连无认证」基线放行。"""
+        sec = (self.headers.get('Sec-Fetch-Site') or '').lower()
+        if sec and sec not in ('same-origin', 'none', 'same-site'):
+            return False, '跨站 GET 被拒绝（Sec-Fetch-Site=%s）' % sec
+        return True, ''
+
+    def _read_body(self):
+        """S4：请求体上限，超限返回 None（调用方回 413）。"""
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except Exception:
+            return {}
+        if n < 0 or n > MAX_BODY:
+            return None
+        try:
+            raw = self.rfile.read(n).decode('utf-8', 'replace') if n > 0 else ''
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
 
     def _send(self, code, body, ctype='application/json; charset=utf-8'):
         data = body.encode('utf-8') if isinstance(body, str) else body
@@ -115,6 +223,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -125,12 +235,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
     def do_GET(self):
-        path = self.path.split('?')[0]
-        if path in STATIC:
-            return self._static(STATIC[path])
-        if path == '/api/scan':
-            return self._json(run_engine(['--scan'], timeout=180))
-        if path == '/api/last':
+        ok, why = self._get_allowed()
+        if not ok:
+            return self._json(dict(status='ERROR', status_text='请求被拒绝',
+                                   warnings=[why], log=[],
+                                   grub=dict(executed=False)), 403)
+        path_only = self.path.split('?')[0]
+        if path_only in STATIC:
+            return self._static(STATIC[path_only])
+        if path_only == '/api/scan':
+            return self._scan()
+        if path_only == '/api/last':
             try:
                 with open(STATE, 'r', encoding='utf-8') as f:
                     return self._json(json.load(f))
@@ -138,15 +253,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(dict(status='SCAN', status_text='尚无执行记录',
                                        notes=['点击「扫描」查看当前内核状态。'],
                                        kernels=[], warnings=[], log=[]))
-        if path == '/api/health':
+        if path_only == '/api/health':
             return self._json(dict(ok=True, app='fncleankernel', port=PORT))
-        if path == '/api/log':
+        if path_only == '/api/log':
             try:
                 with open(LOGFILE, 'r', encoding='utf-8', errors='replace') as f:
                     return self._json(dict(log=f.read()[-30000:]))
             except Exception:
                 return self._json(dict(log=''))
-        if path == '/api/history':
+        if path_only == '/api/history':
             rows = []
             try:
                 with open(HISTORY, 'r', encoding='utf-8') as f:
@@ -163,14 +278,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(dict(rows=rows[-40:]))
         return self._send(404, 'not found', 'text/plain; charset=utf-8')
 
-    def _fix_cron(self):
-        """堵 cron 邮件源头。只有 confirm=true 才会真正改 crontab。"""
+    def _scan(self):
+        """S2：节流 + 独立锁。?force=1 穿透节流并让引擎强制重算 du 缓存。"""
+        query = urllib.parse.urlsplit(self.path).query
+        force = any(p.split('=', 1)[0] == 'force' for p in query.split('&') if p)
+        now = time.time()
+        if (not force and _SCAN_CACHE['data'] is not None and
+                now - _SCAN_CACHE['at'] < SCAN_TTL):
+            return self._json(_SCAN_CACHE['data'])
+        if not SCAN_BUSY.acquire(blocking=False):
+            if _SCAN_CACHE['data'] is not None:
+                return self._json(_SCAN_CACHE['data'])
+            return self._json(dict(status='ERROR', status_text='扫描进行中',
+                                   warnings=['请稍候重试。'], log=[],
+                                   grub=dict(executed=False)), 429)
         try:
-            n = int(self.headers.get('Content-Length') or 0)
-            raw = self.rfile.read(n).decode('utf-8', 'replace') if n > 0 else ''
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {}
+            args = ['--scan', '--force'] if force else ['--scan']
+            R = run_engine(args, timeout=180)
+            _SCAN_CACHE['at'] = time.time()
+            _SCAN_CACHE['data'] = R
+            return self._json(R)
+        finally:
+            SCAN_BUSY.release()
+
+    def _fix_cron_with(self, data):
+        """堵 cron 邮件源头。只有 confirm=true 才会真正改 crontab。"""
         confirmed = data.get('confirm') is True
         args = ['--fix-cron-mail']
         if confirmed:
@@ -190,22 +322,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(dict(status='ERROR', status_text='请求被拒绝',
                                    warnings=[why], log=[],
                                    grub=dict(executed=False)), 403)
-        path = self.path.split('?')[0]
-        if path == '/api/fix-cron-mail':
-            return self._fix_cron()
-        if path != '/api/clean':
+        path_only = self.path.split('?')[0]
+        if path_only not in ('/api/fix-cron-mail', '/api/clean'):
             return self._send(404, 'not found', 'text/plain; charset=utf-8')
+        # S4：所有写操作统一串行锁（原 fix-cron 无锁，与 clean 并发会竞态）
         if not BUSY.acquire(blocking=False):
-            return self._json(dict(status='ERROR', status_text='已有清理任务在执行',
+            return self._json(dict(status='ERROR', status_text='已有任务在执行',
                                    warnings=['请等待上一次任务结束。'],
                                    log=[], grub=dict(executed=False)), 429)
         try:
-            try:
-                n = int(self.headers.get('Content-Length') or 0)
-                raw = self.rfile.read(n).decode('utf-8', 'replace') if n > 0 else ''
-                data = json.loads(raw) if raw else {}
-            except Exception:
-                data = {}
+            data = self._read_body()
+            if data is None:
+                return self._send(413, 'body too large',
+                                  'text/plain; charset=utf-8')
+            if path_only == '/api/fix-cron-mail':
+                return self._fix_cron_with(data)
             if data.get('confirm') is not True:
                 return self._json(dict(status='ERROR',
                                        status_text='缺少执行确认',

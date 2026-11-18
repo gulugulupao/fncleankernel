@@ -434,7 +434,7 @@
     $('s-safe').textContent = prof.safe_kb ? mb(prof.safe_kb) : '1.29 GB';
     $('s-safe').title = '来自 OEC fnOS 1.2.1000→1.2.1010 单次实测，其它机型仅供参考';
     $('s-safe-foot').textContent = prof.peak_kb
-      ? 'OEC 实测峰值 ' + mb(prof.peak_kb) : 'OEC 实测峰值 1.11 GB';
+      ? '更新峰值参考 ' + mb(prof.peak_kb) : '更新峰值参考 1.11 GB';
 
     var rows = R.kernels || [];
     if (!rows.length) {
@@ -479,10 +479,22 @@
     var head = $('r-head');
     head.className = 'result-head' + (bad ? ' bad' : (mid ? ' mid' : ''));
     $('r-title').textContent = R.status_text || st;
-    $('r-desc').textContent = st === 'OK'
+    // E4：GRUB 失败覆盖了内核阶段原始状态时，把「原本的结果」显示出来，
+    // 避免把「安全中止啥也没删」和「删了内核但引导失败」混为一谈。
+    var phase = R.kernel_phase_status || '';
+    var PHASE_LABEL = {
+      OK: '清理成功', NO_OLD_KERNEL: '无旧内核可清', NO_TARGET: '无目标',
+      CACHE_ONLY: '仅缓存清理', UNSAFE_PLAN: '安全中止',
+      HOLD_UNLOCK_FAILED: '解锁失败', PURGE_FAILED: '卸载失败',
+      ERROR: '引擎异常'
+    };
+    var phaseTip = (st === 'GRUB_FAILED' && phase && phase !== st)
+      ? '（内核阶段：' + (PHASE_LABEL[phase] || phase) +
+        '。引导刷新失败不改变这一结果，请先确认 grub.cfg 再决定是否重启。）' : '';
+    $('r-desc').textContent = (st === 'OK'
       ? '选中项已处理完成；保留内核与锁定状态均已复核，引导配置已强制刷新。'
       : (bad ? '详情见下方提示与日志；引导配置仍已按铁律强制刷新。' :
-        '本次没有内核包被删除，但已按要求强制刷新引导配置。');
+        '本次没有内核包被删除，但已按要求强制刷新引导配置。')) + phaseTip;
     pill(bad ? 'danger' : (mid ? 'warn' : 'ok'), R.status_text || st);
 
     var g = R.grub || {};
@@ -543,10 +555,11 @@
     $('result-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
-  function scan() {
+  function scan(force) {
     pill('busy', '扫描中');
     $('btn-scan').disabled = true;
-    fetch('/api/scan', { cache: 'no-store' })
+    // E3：「重新扫描」按钮穿透服务端节流与 du 缓存，首屏加载走缓存。
+    fetch(force ? '/api/scan?force=1' : '/api/scan', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (R) {
         renderScan(R);
@@ -670,7 +683,7 @@
     if (e.key === 'Escape') { qrClose(); cronClose(); }
   });
 
-  $('btn-scan').addEventListener('click', scan);
+  $('btn-scan').addEventListener('click', function () { scan(true); });
   $('btn-clean').addEventListener('click', clean);
   $('btn-load-log').addEventListener('click', loadLog);
   $('btn-copy-diag').addEventListener('click', copyDiag);

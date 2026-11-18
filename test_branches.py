@@ -181,6 +181,129 @@ def cache_only_check():
                 rc=R['grub']['rc'], note=R['grub'].get('note', ''))
 
 
+def _common_mocks():
+    """新场景共用的基线 mock。"""
+    kc.collect = lambda: collect()
+    kc.host_info = lambda: dict(hostname='TEST', kernel=CUR, arch='arm64',
+                                fnos='1.2.1000', soc='rk3566', board='',
+                                model_name='', model_id='', compat_items=[])
+    kc.ssh_info = lambda: dict(active=True, enabled=True, port22=True,
+                               ok=True, hint='')
+    kc.bootloader_info = lambda kv: boot()
+    kc.avail_kb = lambda p: 1600000
+    kc.run_update_grub = lambda: (0, 'ok')
+    kc.selections = lambda: {}
+    kc.dpkg_installed = lambda p: {}
+
+
+def e1_partial_unhold_check():
+    """E1：多包解锁时部分失败，已成功的包必须被恢复 hold（不留半解锁）。"""
+    hdr_old = 'linux-headers-' + OLD
+    _common_mocks()
+    # 两个待解锁包：image 成功、headers 失败
+    kc.collect = lambda: collect(
+        hold_installed=[OLD_PKG], hold_to_unlock=[OLD_PKG, hdr_old],
+        purge=[OLD_PKG, hdr_old], extra_packages=[hdr_old])
+    def sh_unhold(cmd, timeout=600):
+        c = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        if 'apt-get -s purge' in c:
+            return 0, ('Purg %s [%s]\nPurg %s [%s]\n'
+                       % (OLD_PKG, OLD, hdr_old, OLD)), ''
+        if 'apt-mark unhold' in c:
+            return (1, '', 'E: hold busy') if hdr_old in c else (0, '', '')
+        if 'apt-mark hold' in c:
+            return 0, '', ''
+        return 0, '', ''
+    kc.sh = sh_unhold
+    R = kc.do_clean(dry=False)
+    restored = R['hold'].get('restored', [])
+    return dict(status=R['status'], unlocked=R['hold'].get('unlocked', []),
+                restored=restored,
+                ok=(R['status'] == 'HOLD_UNLOCK_FAILED' and
+                    OLD_PKG in R['hold'].get('unlocked', []) and
+                    OLD_PKG in restored))
+
+
+def e2_sim_unparseable_check():
+    """E2：有待清理包但预演解析不出计划 → fail-closed，不裸奔 purge。"""
+    _common_mocks()
+    purged = []
+    def sh_noparse(cmd, timeout=600):
+        c = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        if 'apt-get -s purge' in c:
+            return 0, 'some unrecognized output\n', ''
+        if 'apt-get purge -y' in c:
+            purged.append(c)
+            return 0, 'removed', ''
+        if 'apt-mark unhold' in c or 'apt-mark hold' in c:
+            return 0, '', ''
+        return 0, '', ''
+    kc.sh = sh_noparse
+    R = kc.do_clean(dry=False)
+    return dict(status=R['status'], purge_called=len(purged),
+                ok=(R['status'] == 'UNSAFE_PLAN' and not purged))
+
+
+def e2_surprise_kernel_pkg_check():
+    """E2：预演出现计划外的内核/引导包 → 正向白名单拦下。"""
+    _common_mocks()
+    purged = []
+    def sh_surprise(cmd, timeout=600):
+        c = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        if 'apt-get -s purge' in c:
+            return 0, ('Purg %s [%s]\nPurg u-boot-tools [%s]\n'
+                       % (OLD_PKG, OLD, OLD)), ''
+        if 'apt-get purge -y' in c:
+            purged.append(c)
+            return 0, 'removed', ''
+        if 'apt-mark unhold' in c or 'apt-mark hold' in c:
+            return 0, '', ''
+        return 0, '', ''
+    kc.sh = sh_surprise
+    R = kc.do_clean(dry=False)
+    return dict(status=R['status'], purge_called=len(purged),
+                ok=(R['status'] == 'UNSAFE_PLAN' and not purged))
+
+
+def e4_phase_status_check():
+    """E4：GRUB 失败时保留内核阶段原始状态，不丢失部分成功信息。"""
+    _common_mocks()
+    kc.run_update_grub = lambda: (1, 'grub: fatal')
+    kc.sh = fake_sh_factory()  # 内核阶段 OK
+    R = kc.do_clean(dry=False)
+    return dict(status=R['status'], phase=R.get('kernel_phase_status', ''),
+                ok=(R['status'] == 'GRUB_FAILED' and
+                    R.get('kernel_phase_status') == 'OK'))
+
+
+def e3_force_scan_check():
+    """E3：do_scan(force=True) 时 _cached 收到 force=True。"""
+    seen = {}
+    orig = kc._cached
+    def spy(key, ttl, fn, force=False):
+        seen[key] = force
+        return orig(key, ttl, fn, force=force)
+    kc._cached = spy
+    kc.collect = lambda: collect(candidates=[], purge=[], extra_packages=[])
+    kc.host_info = lambda: dict(hostname='TEST', kernel=CUR, arch='arm64',
+                                fnos='1.2.1000', soc='rk3566', board='',
+                                model_name='', model_id='', compat_items=[])
+    kc.ssh_info = lambda: dict(active=True, enabled=True, port22=True,
+                               ok=True, hint='')
+    kc.bootloader_info = lambda kv: boot()
+    kc.avail_kb = lambda p: 1600000
+    kc.cache_scan = lambda: []
+    kc.cron_mail_source = lambda: []
+    kc.disk_breakdown = lambda: dict(rows=[], total_kb=1, used_kb=1, avail_kb=0)
+    kc.volume_survey = lambda: []
+    kc.precheck = lambda R: dict(items=[], ok=True, advice='', note='')
+    kc.do_scan(force=True)
+    kc._cached = orig
+    return dict(seen=seen,
+                ok=(seen.get('cache_breakdown') is True and
+                    seen.get('cache_volumes') is True))
+
+
 def main():
     rows = []
     for c in CASES:
@@ -234,6 +357,26 @@ def main():
                'PASS' if co_ok else 'FAIL'))
     except Exception as e:
         print('CACHE_ONLY: TEST_CRASH %r -> FAIL' % (e,))
+    # ===== v1.5.5 B 档新增场景 =====
+    print()
+    print('=== v1.5.5 NEW CHECKS ===')
+    new_checks = [
+        ('E1 partial-unhold restore', e1_partial_unhold_check),
+        ('E2 sim unparseable', e2_sim_unparseable_check),
+        ('E2 surprise kernel pkg', e2_surprise_kernel_pkg_check),
+        ('E4 kernel_phase_status', e4_phase_status_check),
+        ('E3 force scan', e3_force_scan_check),
+    ]
+    new_pass = 0
+    for label, fn in new_checks:
+        try:
+            r = fn()
+            print('%-26s %s  detail=%s' %
+                  (label, 'PASS' if r['ok'] else 'FAIL', r))
+            new_pass += 1 if r['ok'] else 0
+        except Exception as e:
+            print('%-26s TEST_CRASH %r -> FAIL' % (label, e))
+    print('NEW CHECKS: %d/%d passed' % (new_pass, len(new_checks)))
 
 
 if __name__ == '__main__':

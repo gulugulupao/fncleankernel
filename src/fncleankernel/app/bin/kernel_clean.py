@@ -31,6 +31,11 @@ import time
 import traceback
 from datetime import datetime
 
+try:
+    import fcntl  # POSIX 文件锁，Windows 本地测试时不可用，降级为无锁
+except ImportError:
+    fcntl = None
+
 APP = os.environ.get('TRIM_APPDEST') or '/vol1/@appcenter/fncleankernel'
 VAR = os.environ.get('TRIM_PKGVAR') or '/vol1/@appdata/fncleankernel'
 LOGDIR = os.path.join(VAR, 'log')
@@ -365,7 +370,7 @@ def base(mode):
         breakdown=dict(rows=[], total_kb=0, used_kb=0, avail_kb=0),
         volumes=[], precheck=dict(items=[], ok=False, advice='', note=''),
         cron_source=[],
-        warnings=[], notes=[], log=[])
+        warnings=[], notes=[], log=[], kernel_phase_status='')
 
 
 def note(R, msg, kind='notes'):
@@ -373,25 +378,51 @@ def note(R, msg, kind='notes'):
     R['log'].append('[%s] %s' % (datetime.now().strftime('%H:%M:%S'), msg))
 
 
+def _atomic_write(path, text):
+    """同目录临时文件 + os.replace 原子替换，避免写中途断电留下半行/截断文件。"""
+    tmp = path + '.tmp.%d' % os.getpid()
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _append_history(R):
-    """每次真实清理追加一行，供趋势图使用；最多留 200 条。"""
+    """每次真实清理追加一行，供趋势图使用；最多留 200 条。
+
+    E5：读-改-写全程 fcntl 独占锁（内核阶段与 CLI 独立进程并发时不丢记录），
+    并改原子替换，避免中途断电留下半行 json。"""
     row = dict(time=R['time'], status=R['status'],
+               kernel_phase_status=R.get('kernel_phase_status') or '',
                selected=R.get('selected', []),
                root_before_kb=R['space']['root_before_kb'],
                root_after_kb=R['space']['root_after_kb'],
                reclaimed_kb=R['space']['reclaimed_kb'],
                cache_reclaimed_bytes=R['cache']['reclaimed_bytes'],
                grub_rc=R['grub']['rc'])
-    lines = []
     try:
-        with open(HISTORY, 'r', encoding='utf-8') as f:
-            lines = f.read().splitlines()[-199:]
-    except Exception:
-        pass
-    lines.append(json.dumps(row, ensure_ascii=False))
-    try:
-        with open(HISTORY, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines) + '\n')
+        os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+        fh = open(HISTORY, 'a+', encoding='utf-8')
+        try:
+            if fcntl:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fh.seek(0)
+            lines = fh.read().splitlines()[-199:]
+            lines.append(json.dumps(row, ensure_ascii=False))
+            _atomic_write(HISTORY, '\n'.join(lines) + '\n')
+        finally:
+            if fcntl:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
     except Exception as e:
         R.setdefault('errors', []).append('write history: %r' % e)
 
@@ -413,8 +444,7 @@ def finish(R):
         # S1：只有真正执行过清理才写 last_result.json；scan 另存 last_scan.json，
         # 否则每次打开页面都会把上次清理结果冲掉，/api/last 与趋势图全部失真。
         if R['mode'] == 'clean':
-            with open(STATE, 'w', encoding='utf-8') as f:
-                json.dump(R, f, ensure_ascii=False, indent=2)
+            _atomic_write(STATE, json.dumps(R, ensure_ascii=False, indent=2))
             _append_history(R)
             # 清理后空间构成已变，让下次 scan 重新统计
             for k in ('cache_breakdown', 'cache_volumes'):
@@ -423,8 +453,7 @@ def finish(R):
                 except OSError:
                     pass
         elif R['mode'] == 'scan':
-            with open(SCAN_STATE, 'w', encoding='utf-8') as f:
-                json.dump(R, f, ensure_ascii=False, indent=2)
+            _atomic_write(SCAN_STATE, json.dumps(R, ensure_ascii=False, indent=2))
         # dry-run 不写任何状态
         with open(LOGFILE, 'a', encoding='utf-8') as f:
             f.write('\n===== %s [%s] %s =====\n' %
@@ -979,21 +1008,24 @@ def do_fix_cron_mail(confirm=False):
     return R
 
 
-def _cached(key, ttl, fn):
-    """du 全盘较慢，体检数据做磁盘缓存，避免每次打开页面都重扫。"""
+def _cached(key, ttl, fn, force=False):
+    """du 全盘较慢，体检数据做磁盘缓存。
+
+    E3：force=True 跳过 mtime 缓存强制重算（前端「重新扫描」按钮），
+    写盘改原子替换，避免并发 scan 写坏缓存文件。"""
     p = os.path.join(VAR, key + '.json')
-    try:
-        st = os.stat(p)
-        if time.time() - st.st_mtime < ttl:
-            with open(p, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
+    if not force:
+        try:
+            st = os.stat(p)
+            if time.time() - st.st_mtime < ttl:
+                with open(p, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
     v = fn()
     try:
         os.makedirs(VAR, exist_ok=True)
-        with open(p, 'w', encoding='utf-8') as f:
-            json.dump(v, f, ensure_ascii=False)
+        _atomic_write(p, json.dumps(v, ensure_ascii=False))
     except Exception:
         pass
     return v
@@ -1102,7 +1134,7 @@ def precheck(R):
                      source='OEC fnOS 1.2.1000→1.2.1010 / 2026-11-12'))
 
 
-def do_scan():
+def do_scan(force=False):
     R = base('scan')
     R['space']['root_before_kb'] = avail_kb('/')
     R['space']['boot_before_kb'] = avail_kb('/boot')
@@ -1133,8 +1165,8 @@ def do_scan():
                  (len(d['candidates']), len(d['extra_packages'])))
         # 「系统盘缓存扫描：…」那条 note 已删：与清理项卡片逐项重复。
         # A1 / A4 的 du 结果做 5 分钟缓存；A2 预检只用已核对的静态事实
-        R['breakdown'] = _cached('cache_breakdown', 300, disk_breakdown)
-        R['volumes'] = _cached('cache_volumes', 300, volume_survey)
+        R['breakdown'] = _cached('cache_breakdown', 300, disk_breakdown, force=force)
+        R['volumes'] = _cached('cache_volumes', 300, volume_survey, force=force)
         R['precheck'] = precheck(R)
         R['status'] = 'SCAN'
     except Exception:
@@ -1243,13 +1275,36 @@ def do_clean(dry=False, items=None):
             note(R, 'apt-get -s purge 预演失败（rc=%d），已中止：%s' %
                  (rc, sim_err[-600:]), 'warnings')
             return R
+        # E2：fail-closed —— 有待清理包却解析不出预演计划，说明 apt 输出
+        # 格式/locale 变了，负向白名单此时形同虚设，宁可中止不可裸奔 purge。
+        if d['purge'] and not planned:
+            R['status'] = 'UNSAFE_PLAN'
+            note(R, 'UNSAFE_PLAN：apt 预演未能解析出任何待删包（输出格式可能变化），'
+                    '白名单无法校验，已 fail-closed 中止；原始预演见诊断信息。',
+                 'warnings')
+            return R
         if unsafe:
             R['status'] = 'UNSAFE_PLAN'
             note(R, 'UNSAFE_PLAN：预演将删除保留包 %s，已安全中止。' %
                  ', '.join(unsafe), 'warnings')
             return R
-        note(R, 'apt 预演通过：将删除 %d 个包，未触碰任何保留内核。' %
-             len(planned if planned else d['purge']))
+        # E2：正向白名单 —— 预演里若出现计划外且不属于清理版本族的「内核系」
+        # 包（如依赖树连带删 u-boot-tools / grub-efi），同样中止。
+        planned_set = set(planned)
+        allowed_extra = set(d['purge'])
+        surprise = []
+        for p in sorted(planned_set - allowed_extra):
+            if p.startswith(('linux-image-', 'linux-headers-', 'linux-modules-',
+                             'linux-modules-trim-', 'initramfs-',
+                             'grub-', 'grub2-', 'u-boot')):
+                surprise.append(p)
+        if surprise:
+            R['status'] = 'UNSAFE_PLAN'
+            note(R, 'UNSAFE_PLAN：预演将删除计划外的内核/引导相关包 %s，'
+                    '已安全中止（正向白名单）。' % ', '.join(surprise), 'warnings')
+            return R
+        note(R, 'apt 预演通过：将删除 %d 个包，未触碰保留内核与计划外的引导包。' %
+             len(planned))
 
         if dry:
             R['status'] = 'SCAN'
@@ -1272,6 +1327,10 @@ def do_clean(dry=False, items=None):
                 R['status'] = 'HOLD_UNLOCK_FAILED'
                 note(R, '以下内核被锁定且解锁失败，已跳过清理：%s' %
                      ', '.join(R['hold']['failed']), 'warnings')
+                # E1：部分 unhold 已成功时也必须恢复，否则这些包永久停在
+                # 非 hold 状态、且下次 collect 不再认领 → 半解锁不自愈。
+                if R['hold']['unlocked']:
+                    _restore_unlocked(R)
                 return R
 
         # 正式清理
@@ -1314,6 +1373,9 @@ def do_clean(dry=False, items=None):
         # 内容前后逐字节一致；跳过可避免无意义写盘、约 3.7s 耗时，
         # 以及把零风险的缓存清理污染成 GRUB_FAILED。用户 2026-11-13 拍板。
         if not dry and do_kernel:
+            # E4：先记下内核阶段原始状态，GRUB 失败覆盖 status 时不再丢失
+            # 「部分成功 / 安全中止」的信息，历史与前端都能看到。
+            R['kernel_phase_status'] = R['status']
             rc_g, out_g = run_update_grub()
             R['grub'] = dict(executed=True, forced=True, rc=rc_g, output=out_g,
                              note='无条件执行（涉及内核包变更，无论清理结果如何）')
@@ -1335,14 +1397,34 @@ def do_clean(dry=False, items=None):
     return R
 
 
+def _restore_unlocked(R):
+    """E1：仅恢复本次真正 unhold 成功的包（可能含 headers/modules）。
+
+    调用点是 HOLD_UNLOCK_FAILED：purge 从未发生，这些包必然仍安装，
+    直接 apt-mark hold 即可，不依赖再次 selections()（避免 dpkg 状态
+    读取时序/缓存导致漏恢复）。apt-mark hold 对已 hold 的包是幂等的。"""
+    for p in R['hold'].get('unlocked', []):
+        try:
+            rc, out, err = sh(['apt-mark', 'hold', p], timeout=90)
+            if rc == 0 and p not in R['hold']['restored']:
+                R['hold']['restored'].append(p)
+                note(R, '已恢复临时解锁的包：%s' % p)
+        except Exception:
+            pass
+
+
 def _restore_hold(R, d):
-    """把仍安装、且原本是 hold 的 linux-image 包恢复为 hold（官方默认策略）"""
+    """把仍安装、且原本是 hold 的 linux-image 包恢复为 hold（官方默认策略）。
+
+    E1：同时覆盖本次已 unhold 成功、但仍安装的包（headers/modules 等），
+    它们可能不在 hold_installed（那是纯 image 包集合）里。"""
     sel = selections()
     imgs = dpkg_installed('linux-image-*')
-    for p in d['hold_installed']:
+    targets = set(d['hold_installed']) | set(R['hold'].get('unlocked', []))
+    for p in sorted(targets):
         if p in imgs and sel.get(p) != 'hold':
             rc, out, err = sh(['apt-mark', 'hold', p], timeout=90)
-            if rc == 0:
+            if rc == 0 and p not in R['hold']['restored']:
                 R['hold']['restored'].append(p)
     if R['hold']['restored']:
         note(R, '已恢复锁定：%s' % ', '.join(R['hold']['restored']))
@@ -1365,7 +1447,7 @@ def main():
     elif '--dry-run' in args:
         R = do_clean(dry=True, items=items)
     else:
-        R = do_scan()
+        R = do_scan(force=('--force' in args))
     print(json.dumps(R, ensure_ascii=False, indent=2))
     return 2 if R['status'] == 'GRUB_FAILED' else 0
 

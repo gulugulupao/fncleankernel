@@ -54,6 +54,23 @@ _ALLOWED_HOSTS_EXTRA = set(
     x.strip().lower() for x in
     os.environ.get('FNCLEAN_ALLOWED_HOSTS', '').split(',') if x.strip())
 
+# v1.5.8：飞牛官方域名后缀默认可信。FN Connect 远程访问的地址是
+# <FN ID>.fnos.net / appXXX.fnos.net（官方帮助中心与论坛实际用法），
+# 官方主站/论坛/帮助为 fnnas.com 及其子域。此前 Host 白名单只认本机名/IP，
+# 走这些官方域名打开应用页时写接口会被误判为不可信（"Host 不在允许列表"），
+# 导致远程场景下一键清理整个失败。这里只额外放行官方后缀的域名：
+# 攻击者的 evil.example 之类仍被拒，DNS rebinding 防护（S1）保留。
+# 用户自己的 DDNS 域名 continue 可用 FNCLEAN_ALLOWED_HOSTS 环境变量追加。
+FNCLEAN_TRUSTED_SUFFIXES = ('fnos.net', 'fnnas.com')
+
+
+def _under_official_domain(host):
+    """host 是否飞牛官方域及其子域（精确后缀边界，防 evilfnos.net 绕过）。"""
+    for suf in FNCLEAN_TRUSTED_SUFFIXES:
+        if host == suf or host.endswith('.' + suf):
+            return True
+    return False
+
 
 def _local_hosts():
     names = {'localhost', '127.0.0.1', '::1', '[::1]'}
@@ -152,7 +169,10 @@ def _trusted_host(value):
         ipaddress.ip_address(h)      # IP 字面量：放行
         return True
     except ValueError:
-        return False
+        pass
+    if _under_official_domain(h):    # v1.5.8：飞牛官方域名（FN Connect 等）
+        return True
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):

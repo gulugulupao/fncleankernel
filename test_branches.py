@@ -276,6 +276,38 @@ def e4_phase_status_check():
                     R.get('kernel_phase_status') == 'OK'))
 
 
+def host_whitelist_check():
+    """v1.5.8：飞牛官方域名默认可信，攻击域名仍拒（DNS rebinding 防护保留）。"""
+    spec2 = importlib.util.spec_from_file_location(
+        'kcweb', APP + '/web/server.py')
+    srv = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(srv)
+
+    trusted = [
+        'zxszjyzyx.fnos.net',        # FN Connect 设备子域
+        'app123456.fnos.net',        # FN Connect appXXX 子域
+        'fnos.net',                  # 官方主域
+        'fnnas.com',                 # 官方主域
+        'club.fnnas.com',            # 官方论坛子域
+        'help.fnnas.com',            # 官方帮助子域
+    ]
+    rejected = [
+        'evil.example',              # 典型 DNS rebinding 域名
+        'evilfnos.net',              # 后缀边界绕过（缺 .）
+        'fnos.net.evil.com',         # 反向前缀绕过
+        'notfnnas.com',              # 官方域名前缀伪装
+        'app.fnos.net.attacker.io',  # 嵌套绕过
+    ]
+    ok_trusted = all(srv._trusted_host(h) for h in trusted)
+    ok_rejected = all(not srv._trusted_host(h) for h in rejected)
+    # IP 字面量放行 / 空值放行（原有基线不回退）
+    baseline = (srv._trusted_host('192.168.3.17') and
+                srv._trusted_host('127.0.0.1') and
+                srv._trusted_host(''))
+    return dict(ok=ok_trusted and ok_rejected and baseline,
+                trusted=ok_trusted, rejected=ok_rejected, baseline=baseline)
+
+
 def app_log_safety_check():
     """v1.5.7：应用日志白名单 + 截断（不删除、保留 inode）。"""
     import tempfile
@@ -417,6 +449,7 @@ def main():
         ('E4 kernel_phase_status', e4_phase_status_check),
         ('E3 force scan', e3_force_scan_check),
         ('v1.5.7 app-log safety', app_log_safety_check),
+        ('v1.5.8 host whitelist', host_whitelist_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

@@ -276,6 +276,56 @@ def e4_phase_status_check():
                     R.get('kernel_phase_status') == 'OK'))
 
 
+def app_log_safety_check():
+    """v1.5.7：应用日志白名单 + 截断（不删除、保留 inode）。"""
+    import tempfile
+    import os as _os
+    root = tempfile.mkdtemp(prefix='appdata_')
+    kc.APPDATA_ROOT = root
+    kc.APP_LOG_MIN = 10  # 测试threshold放低
+
+    def mk(rel, size, link_to=None):
+        p = _os.path.join(root, rel)
+        _os.makedirs(_os.path.dirname(p), exist_ok=True)
+        with open(p, 'wb') as f:
+            f.write(b'x' * size)
+        if link_to:
+            try:
+                _os.remove(p)
+                _os.symlink(link_to, p)
+            except OSError:
+                pass
+        return p
+
+    ok_log = mk('baidu.netdisk/sdks/1000/stdout.log', 500)       # 白名单内
+    ok_err = mk('someapp/log/error.log', 300)                     # .log 结尾
+    small = mk('someapp/log/tiny.log', 5)                         # 小于阈值
+    outside = _os.path.join(_os.path.dirname(root), 'outside.log')
+    with open(outside, 'wb') as f:
+        f.write(b'x' * 500)
+
+    checks = {
+        'whitelist_stdout': kc._is_app_log(ok_log),
+        'whitelist_dotlog': kc._is_app_log(ok_err),
+    }
+    # 白名单函数本身不看大小，单独验证 scan 会过滤小文件
+    info = kc._app_logs_scan()
+    checks['scan_filters_small'] = (info['count'] == 2 and
+                                    all(x['size'] >= kc.APP_LOG_MIN
+                                        for x in info['files']))
+    checks['reject_outside'] = not kc._is_app_log(outside)
+
+    # 截断测试：保留 inode、size 归零、文件仍存在
+    inode_before = _os.stat(ok_log).st_ino
+    res = kc._app_logs_truncate({})
+    checks['truncateFreed'] = res['reclaimed_bytes'] >= 800
+    checks['fileStillExists'] = _os.path.isfile(ok_log)
+    checks['inodePreserved'] = _os.stat(ok_log).st_ino == inode_before
+    checks['sizeZero'] = _os.stat(ok_log).st_size == 0
+
+    return dict(checks=checks, ok=all(checks.values()))
+
+
 def e3_force_scan_check():
     """E3：do_scan(force=True) 时 _cached 收到 force=True。"""
     seen = {}
@@ -366,6 +416,7 @@ def main():
         ('E2 surprise kernel pkg', e2_surprise_kernel_pkg_check),
         ('E4 kernel_phase_status', e4_phase_status_check),
         ('E3 force scan', e3_force_scan_check),
+        ('v1.5.7 app-log safety', app_log_safety_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

@@ -592,8 +592,8 @@
     if (risky.length) {
       var names = risky.map(function (id) { return '· ' + itemLabel(id); });
       if (!window.confirm('以下项目需要额外确认：\n\n' + names.join('\n') +
-        '\n\n它们会调用系统日志轮转 / 按邮件逐封过滤，' +
-        '请确认已看过上方每项的说明。\n\n继续？')) return;
+        '\n\n它们会调用系统日志轮转 / 按邮件逐封过滤 / 把第三方应用大日志截断为 0 字节' +
+        '（文件保留、不删除），请确认已看过上方每项的说明。\n\n继续？')) return;
     }
     var btn = $('btn-clean');
     btn.disabled = true;

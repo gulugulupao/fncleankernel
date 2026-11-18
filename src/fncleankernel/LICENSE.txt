@@ -1,5 +1,5 @@
 =======================================================================
-fncleankernel（旧内核清理）V1.5.6 — LICENSE（开源授权 / Open Source License）
+fncleankernel（旧内核清理）V1.5.7 — LICENSE（开源授权 / Open Source License）
 授权采用 MIT License，并附加保护条款与支持范围声明。
 Licensed under the MIT License with Additional Protection Terms
 and a Support Scope & Disclaimer.
@@ -121,6 +121,6 @@ restrictions; in case of conflict, this section prevails.
   The prebuilt fpk contains all source and scripts under this license.
 
 =======================================================================
-fncleankernel（旧内核清理）V1.5.6
+fncleankernel（旧内核清理）V1.5.7
 © 2026 很多问题的小明同学 · GitHub @gulugulupao
 =======================================================================

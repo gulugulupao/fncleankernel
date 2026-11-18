@@ -103,6 +103,11 @@ CACHE_DEFS = [
     dict(id='journal', name='systemd 归档日志',
          desc='执行 journalctl --vacuum-time=7d，只保留最近 7 天。',
          risk='low', default=False, label='可回收'),
+    dict(id='app_logs', name='第三方应用大日志',
+         desc='只扫 /usr/local/apps/@appdata/ 下超过 50 MB 的 .log / stdout.log / '
+              'stderr.log；仅把这些文件截断为 0 字节（保留原文件与 inode，'
+              '正在写的应用不受影响），绝不删除文件、不碰系统日志与数据卷。',
+         risk='mid', default=False, label='可回收', confirm=True),
 ]
 CACHE_IDS = {c['id'] for c in CACHE_DEFS}
 CACHE_NAMES = {c['id']: c['name'] for c in CACHE_DEFS}
@@ -739,6 +744,86 @@ def _journal_info():
     return 0, '', False
 
 
+# ===== v1.5.7 第三方应用大日志（安全的日志截断，不删文件）=====
+APPDATA_ROOT = '/usr/local/apps/@appdata'
+APP_LOG_MIN = 50 * 1024 * 1024      # 只列 50 MB 以上的日志，小日志不碰
+
+
+def _is_app_log(path):
+    """白名单判定：必须是 @appdata 下、以日志名结尾的普通文件。
+
+    绝不返回符号链接（避免跟随到系统文件）、绝不返回目录、绝不返回
+    白名单根目录之外的路径。"""
+    try:
+        # 用 realpath 比对，避免软链目录绕过；sep 用 os.sep 兼容本地测试
+        if os.path.commonpath([os.path.abspath(path),
+                               os.path.abspath(APPDATA_ROOT)]) != os.path.abspath(APPDATA_ROOT):
+            return False
+        # path 必须严格在根目录下（不能等于根目录本身）
+        if os.path.abspath(path) == os.path.abspath(APPDATA_ROOT):
+            return False
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        base = os.path.basename(path).lower()
+        return base == 'stdout.log' or base == 'stderr.log' or base.endswith('.log')
+    except Exception:
+        return False
+
+
+def _app_logs_scan():
+    """只读：列出 @appdata 下超过阈值的大日志，按大小降序。"""
+    rows = []
+    if not os.path.isdir(APPDATA_ROOT):
+        return dict(files=[], bytes=0, count=0)
+    for root, dirs, files in os.walk(APPDATA_ROOT, followlinks=False):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for fn in files:
+            p = os.path.join(root, fn)
+            if not _is_app_log(p):
+                continue
+            try:
+                st = os.stat(p)
+                if st.st_size >= APP_LOG_MIN:
+                    rows.append(dict(path=p, size=st.st_size,
+                                     size_str=human(st.st_size),
+                                     app=os.path.basename(root)))
+            except OSError:
+                pass
+    rows.sort(key=lambda x: x['size'], reverse=True)
+    return dict(files=rows, bytes=sum(x['size'] for x in rows), count=len(rows))
+
+
+def _app_logs_truncate(R):
+    """只把白名单内的大日志截断为 0 字节，保留文件与 inode。
+
+    用 r+b 打开后 truncate(0)：文件描述符指向同一 inode，正在写日志的应用
+    不会因文件被删而报错（这是比 rm 安全的关键）。每次都重新过 _is_app_log
+    白名单，防止扫描后文件被替换成符号链接。"""
+    info = _app_logs_scan()
+    freed, done, failed = 0, 0, 0
+    detail = []
+    for ent in info['files']:
+        p = ent['path']
+        try:
+            if not _is_app_log(p):          # 二次校验，防 TOCTOU
+                failed += 1
+                continue
+            before = os.stat(p).st_size
+            with open(p, 'r+b') as f:
+                f.truncate(0)
+            after = os.stat(p).st_size
+            if after == 0:
+                freed += before
+                done += 1
+                detail.append('%s(-%s)' % (os.path.basename(p), human(before)))
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    return dict(reclaimed_bytes=freed, removed=done, failed=failed,
+                detail=', '.join(detail)[:800])
+
+
 def cache_scan():
     """只读扫描：给出每项的真机实测字节数，供前端逐项勾选。"""
     apt = _apt_cache_files()
@@ -746,13 +831,16 @@ def cache_scan():
     jb, jpath, j_emmc = _journal_info()
     fr = _force_rotate_info()
     cm = _cron_mail_info()
+    al = _app_logs_scan()
     size = dict(apt_cache=_files_size(apt),
                 syslog_rotated=_files_size(rot),
                 log_force_rotate=fr['bytes'],
-                cron_mail=cm['cron_bytes'], journal=jb)
+                cron_mail=cm['cron_bytes'], journal=jb,
+                app_logs=al['bytes'])
     count = dict(apt_cache=len(apt), syslog_rotated=len(rot),
                  log_force_rotate=len(fr['files']),
-                 cron_mail=cm['cron_count'], journal=0)
+                 cron_mail=cm['cron_count'], journal=0,
+                 app_logs=al['count'])
     items = []
     for d in CACHE_DEFS:
         e = dict(d)
@@ -794,6 +882,19 @@ def cache_scan():
                               '（退信、安全告警等）。'
                               % (cm['cron_count'], human(cm['cron_bytes']),
                                  cm['other_count']))
+        elif d['id'] == 'app_logs':
+            e['actionable'] = al['count'] > 0
+            e['entries'] = al['files']
+            if not al['count']:
+                e['risk'] = 'info'
+                e['label'] = '未发现'
+                e['desc'] = '第三方应用目录里没有超过 50 MB 的日志，无需清理。'
+            else:
+                top = al['files'][0]
+                e['desc'] += (' 实测 %d 个大日志合计 %s，最大的是 %s（%s）；'
+                              '只截断文件内容、保留文件本身，应用不受影响。'
+                              % (al['count'], human(al['bytes']),
+                                 top['app'], top['size_str']))
         elif d['id'] == 'mon_residue':
             ms = mon_residue_scan()
             e['bytes'] = ms['bytes']
@@ -917,6 +1018,13 @@ def cache_clean(R, ids):
                 e['reclaimed_bytes'] = max(0, before - after)
                 e['detail'] = ((out + err).strip()[-300:] or
                                'journalctl --vacuum-time=7d rc=%d' % rc)
+            elif cid == 'app_logs':
+                res = _app_logs_truncate(R)
+                e['rc'] = 0 if res['failed'] == 0 else 1
+                e['reclaimed_bytes'] = res['reclaimed_bytes']
+                e['detail'] = ('截断 %d 个应用大日志，失败 %d 个（文件均保留）；'
+                               '%s' % (res['removed'], res['failed'],
+                                       res['detail'] or '无'))
         except Exception as ex:
             e['rc'] = 125
             e['detail'] = repr(ex)
@@ -1489,6 +1597,16 @@ def do_diagnose():
                      'apt-mark showhold 2>/dev/null | grep -E "^linux" | head -40'])
     sec('apt_cache', ['sh', '-c',
                       'du -sh /var/cache/apt /var/lib/apt/lists 2>/dev/null'])
+
+    # 5b. 第三方应用大日志 —— 本次诊断的元凶（907MB stdout.log）
+    al = _app_logs_scan()
+    D['app_logs'] = dict(count=al['count'], bytes=al['bytes'],
+                         files=[dict(path=x['path'], size_str=x['size_str'],
+                                     app=x['app']) for x in al['files']])
+    sec('app_big_logs', ['sh', '-c',
+                         'find /usr/local/apps/@appdata -xdev -type f '
+                         '-name "*.log" -size +50M 2>/dev/null | '
+                         'head -30 | xargs -r du -h 2>/dev/null | sort -hr'])
 
     # 6. 引导链路
     sec('bootloader', ['sh', '-c',

@@ -307,10 +307,18 @@ class Handler(BaseHTTPRequestHandler):
                              ', '.join(D.get('dpkg_kernel_versions') or []) or '(无)')
                 lines.append('疑似野生内核目录(dpkg 未登记且非当前): ' +
                              (', '.join(wild) if wild else '无'))
+                al = D.get('app_logs') or {}
+                if al.get('count'):
+                    lines.append('第三方应用大日志: %d 个合计 %s' %
+                                 (al['count'],
+                                  '%.0f MB' % (al.get('bytes', 0) / 1048576.0)))
+                    for f in al.get('files', [])[:10]:
+                        lines.append('  · %s  %s' % (f.get('size_str', ''),
+                                                     f.get('path', '')))
                 lines.append('')
                 for name in ['uname', 'os_version', 'uptime', 'date', 'df',
                              'df_k', 'df_inode', 'usr_top', 'var_top', 'usr_lib_top',
-                             'big_files', 'modules_dirs', 'modules_list', 'src_dirs',
+                             'big_files', 'app_big_logs', 'modules_dirs', 'modules_list', 'src_dirs',
                              'boot_files', 'dpkg_kernels', 'apt_hold', 'apt_cache',
                              'bootloader', 'journal_err', 'dmesg_tail', 'syslog_tail']:
                     lines.append('===== %s =====' % name)

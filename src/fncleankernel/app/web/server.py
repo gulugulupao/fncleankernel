@@ -9,6 +9,7 @@ v1.5.5 安全加固：
   S4 请求体上限 + 连接超时 + 写接口统一串行锁
   保持用户已拍板的基线：默认 0.0.0.0 无认证、不改绑、不加登录。
 """
+import io
 import ipaddress
 import json
 import os
@@ -18,6 +19,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WEB = os.path.dirname(os.path.abspath(__file__))
@@ -255,6 +257,8 @@ class Handler(BaseHTTPRequestHandler):
                                        kernels=[], warnings=[], log=[]))
         if path_only == '/api/health':
             return self._json(dict(ok=True, app='fncleankernel', port=PORT))
+        if path_only == '/api/diagnose':
+            return self._diagnose_zip()
         if path_only == '/api/log':
             try:
                 with open(LOGFILE, 'r', encoding='utf-8', errors='replace') as f:
@@ -277,6 +281,62 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return self._json(dict(rows=rows[-40:]))
         return self._send(404, 'not found', 'text/plain; charset=utf-8')
+
+    def _diagnose_zip(self):
+        """只读诊断采集 → 内存 zip 下载。不清理、不改系统。
+
+        zip 内含人可读的 诊断报告.txt（按分区逐节）和原始 诊断数据.json，
+        用户在飞牛网页点「导出诊断包」即可下载，发给作者排查。
+        诊断本身可能较慢（du/dmesg/journalctl），最长 5 分钟。"""
+        D = run_engine(['--diagnose'], timeout=300)
+        if not isinstance(D, dict) or 'sections' not in D:
+            return self._json(dict(error='诊断采集失败', raw=str(D)[:500]), 500)
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+                secs = D.get('sections', {})
+                # 人可读报告
+                lines = ['系统盘清理助手 · 只读诊断报告',
+                         '生成时间: ' + str(D.get('time', '-')),
+                         '说明: 全部为只读采集，未删除/修改任何系统文件。',
+                         '']
+                wild = D.get('wild_kernel_dirs') or []
+                lines.append('===== 关键结论 =====')
+                lines.append('当前运行内核: ' + str(D.get('current_kernel', '-')))
+                lines.append('dpkg 登记的内核版本: ' +
+                             ', '.join(D.get('dpkg_kernel_versions') or []) or '(无)')
+                lines.append('疑似野生内核目录(dpkg 未登记且非当前): ' +
+                             (', '.join(wild) if wild else '无'))
+                lines.append('')
+                for name in ['uname', 'os_version', 'uptime', 'date', 'df',
+                             'df_k', 'df_inode', 'usr_top', 'var_top', 'usr_lib_top',
+                             'big_files', 'modules_dirs', 'modules_list', 'src_dirs',
+                             'boot_files', 'dpkg_kernels', 'apt_hold', 'apt_cache',
+                             'bootloader', 'journal_err', 'dmesg_tail', 'syslog_tail']:
+                    lines.append('===== %s =====' % name)
+                    lines.append(str(secs.get(name, '(空)')))
+                    lines.append('')
+                if D.get('errors'):
+                    lines.append('===== 采集异常 =====')
+                    lines.extend(str(x) for x in D['errors'])
+                z.writestr('诊断报告.txt', '\n'.join(lines).encode('utf-8'))
+                z.writestr('诊断数据.json',
+                           json.dumps(D, ensure_ascii=False, indent=2).encode('utf-8'))
+        except Exception as ex:
+            return self._json(dict(error='打包失败', detail=repr(ex)), 500)
+        data = buf.getvalue()
+        # 固定文件名，避免中文/时间导致部分浏览器下载异常
+        fname = 'fncleankernel-diagnose.zip'
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/zip')
+        self.send_header('Content-Disposition', 'attachment; filename="%s"' % fname)
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
 
     def _scan(self):
         """S2：节流 + 独立锁。?force=1 穿透节流并让引擎强制重算 du 缓存。"""

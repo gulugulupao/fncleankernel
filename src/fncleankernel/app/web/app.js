@@ -687,5 +687,28 @@
   $('btn-clean').addEventListener('click', clean);
   $('btn-load-log').addEventListener('click', loadLog);
   $('btn-copy-diag').addEventListener('click', copyDiag);
+  $('btn-export-diag').addEventListener('click', function () {
+    var btn = $('btn-export-diag');
+    btn.disabled = true;
+    pill('busy', '正在采集诊断');
+    fetch('/api/diagnose', { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'fncleankernel-diagnose.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
+        pill('ok', '诊断包已导出');
+      })
+      .catch(function (e) { pill('danger', '导出失败：' + String(e)); })
+      .finally(function () { btn.disabled = false; });
+  });
   scan();
 })();

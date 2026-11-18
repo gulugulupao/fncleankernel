@@ -1430,6 +1430,122 @@ def _restore_hold(R, d):
         note(R, '已恢复锁定：%s' % ', '.join(R['hold']['restored']))
 
 
+def do_diagnose():
+    """v1.5.6 只读诊断采集：把设备上跟系统盘/内核相关的现场一次性抓全，
+    供用户导出 zip 发给作者排查。
+
+    严格只读：不清理、不删除、不卸载、不写系统；只在自身 VAR 目录留一份
+    JSON 快照。全部命令都是查询类（uname/df/du/dpkg/ls/cat/journalctl -p err）。
+    重点覆盖「dpkg 看不见的野生内核目录」——这是 V1.3.2 查不出的盲区。
+    """
+    def _run(argv, timeout=180):
+        try:
+            rc, out, err = sh(argv, timeout=timeout)
+            return (out or '').strip()
+        except Exception as ex:
+            return 'ERROR: %r' % ex
+
+    D = {'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+         'sections': {}, 'errors': []}
+
+    def sec(name, argv, timeout=180):
+        D['sections'][name] = _run(argv, timeout)
+
+    # 1. 身份与系统版本
+    sec('uname', ['uname', '-a'])
+    sec('os_version', ['sh', '-c', 'cat /usr/trim/etc/version 2>/dev/null; '
+                        'cat /etc/os-release 2>/dev/null | head -8'])
+    sec('uptime', ['uptime'])
+    sec('date', ['date'])
+
+    # 2. 分区占用（系统盘 / 引导 / 数据卷）
+    sec('df', ['df', '-h'])
+    sec('df_k', ['df', '-k', '/', '/boot', '/vol1'])
+    sec('df_inode', ['df', '-i', '/'])
+
+    # 3. /usr 与 /var 一级子目录 —— 定位系统盘大头
+    sec('usr_top', ['sh', '-c', 'du -h -d 1 /usr 2>/dev/null | sort -hr | head -30'])
+    sec('var_top', ['sh', '-c', 'du -h -d 1 /var 2>/dev/null | sort -hr | head -30'])
+    sec('usr_lib_top', ['sh', '-c', 'du -h -d 2 /usr/lib 2>/dev/null | sort -hr | head -25'])
+    sec('big_files', ['sh', '-c',
+                      'find /usr /var -xdev -type f -size +20M 2>/dev/null | '
+                      'head -40 | xargs -r du -h 2>/dev/null | sort -hr | head -30'])
+
+    # 4. 内核目录明细 —— 关键：野生目录（dpkg 看不见但实占空间）
+    sec('modules_dirs', ['sh', '-c',
+                         'du -sh /usr/lib/modules/* /lib/modules/* 2>/dev/null | sort -hr'])
+    sec('modules_list', ['sh', '-c',
+                         'ls -la /usr/lib/modules/ 2>/dev/null; echo ---; '
+                         'ls -la /lib/modules/ 2>/dev/null'])
+    sec('src_dirs', ['sh', '-c', 'ls -la /usr/src 2>/dev/null | head -30'])
+    sec('boot_files', ['sh', '-c',
+                       'ls -lah /boot 2>/dev/null | head -40'])
+
+    # 5. dpkg 登记的内核（与目录对比 → 找出野生残留）
+    sec('dpkg_kernels', ['sh', '-c',
+                         'dpkg -l 2>/dev/null | grep -E "linux-image|linux-headers" | '
+                         'awk \'{print $1, $2, $3}\''])
+    sec('apt_hold', ['sh', '-c',
+                     'apt-mark showhold 2>/dev/null | grep -E "^linux" | head -40'])
+    sec('apt_cache', ['sh', '-c',
+                      'du -sh /var/cache/apt /var/lib/apt/lists 2>/dev/null'])
+
+    # 6. 引导链路
+    sec('bootloader', ['sh', '-c',
+                       'echo "=== extlinux ==="; cat /boot/extlinux/extlinux.conf 2>/dev/null | head -20; '
+                       'echo "=== grub head ==="; head -30 /boot/grub/grub.cfg 2>/dev/null'])
+
+    # 7. 日志与健康（只读）
+    sec('journal_err', ['sh', '-c',
+                        'journalctl -p err -n 80 --no-pager 2>/dev/null | tail -80'])
+    sec('dmesg_tail', ['sh', '-c', 'dmesg 2>/dev/null | tail -80'])
+    sec('syslog_tail', ['sh', '-c', 'tail -120 /var/log/syslog 2>/dev/null'])
+
+    # 8. 派生结论：野生内核目录（目录里有，dpkg 没登记，且不是当前运行内核）
+    try:
+        cur = _run(['uname', '-r']).split()[0]
+        # 只从 du 输出取「实际占空间」的目录，并排除 0 字节空目录
+        # （OES 上 c1151 就是 0 字节空壳，不应报成野生残留误导用户）
+        wild = []
+        for line in D['sections'].get('modules_dirs', '').splitlines():
+            m = re.match(r'^\s*([\d.]+)([KMGTP]?)\s+(?:/usr)?/lib/modules/([^\s/]+)', line)
+            if not m:
+                continue
+            size, unit, ver = m.group(1), m.group(2), m.group(3)
+            if float(size) == 0 or ver == cur:
+                continue
+            wild.append(ver)
+        dpkg_txt = D['sections'].get('dpkg_kernels', '')
+        dpkg_vers = set(re.findall(r'linux-(?:image|headers)-([\d][\w.\-]+)', dpkg_txt))
+        wild = sorted(v for v in set(wild)
+                      if not any(v.startswith(p) or p.startswith(v) for p in dpkg_vers))
+        D['wild_kernel_dirs'] = wild
+        D['current_kernel'] = cur
+        D['dpkg_kernel_versions'] = sorted(dpkg_vers)
+    except Exception as ex:
+        D['errors'].append('wild-detect: %r' % ex)
+        D['wild_kernel_dirs'] = []
+
+    # 脱敏：日志里偶发出现的 token / 密码 / Authorization 头，避免随诊断包外泄
+    def _sanitize(text):
+        text = re.sub(r'(?i)(password|passwd|pwd|token|secret|api[_-]?key)\s*[:=]\s*\S+',
+                      r'\1=<已脱敏>', text)
+        text = re.sub(r'(?i)(Authorization\s*:\s*)\S+\s+\S+', r'\1<已脱敏>', text)
+        text = re.sub(r'([A-Za-z0-9+/]{40,}={0,2})', '<长串已脱敏>', text)
+        return text
+    for _k in list(D['sections']):
+        D['sections'][_k] = _sanitize(str(D['sections'][_k]))
+
+    # 落一份 JSON 快照到本地 VAR（不写系统目录）
+    try:
+        os.makedirs(VAR, exist_ok=True)
+        snap = os.path.join(VAR, 'diagnose_snapshot.json')
+        _atomic_write(snap, json.dumps(D, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+    return D
+
+
 def main():
     args = sys.argv[1:]
     items = None
@@ -1437,6 +1553,11 @@ def main():
         if a.startswith('--items='):
             items = [x.strip() for x in a.split('=', 1)[1].split(',')
                      if x.strip()]
+    if '--diagnose' in args:
+        # 只读诊断采集：不清理、不改系统，输出 JSON 供后端打包 zip
+        D = do_diagnose()
+        print(json.dumps(D, ensure_ascii=False, indent=2))
+        return 0
     if '--fix-cron-mail' in args:
         # 独立操作：不写状态、不跑 grub，只处理 crontab，必须显式 --confirm
         R = do_fix_cron_mail(confirm=('--confirm' in args))

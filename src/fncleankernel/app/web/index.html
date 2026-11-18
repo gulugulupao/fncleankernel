@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>系统盘清理助手 · fnOS ARM</title>
-<link rel="stylesheet" href="style.css?v=10">
+<link rel="stylesheet" href="style.css?v=11">
 </head>
 <body>
 <div class="wrap">
@@ -148,7 +148,9 @@
       <div class="actions">
         <button class="btn btn-ghost" id="btn-load-log" type="button">查看完整运行日志</button>
         <button class="btn btn-ghost" id="btn-copy-diag" type="button">复制诊断信息</button>
+        <button class="btn btn-ghost" id="btn-export-diag" type="button">导出诊断包（zip）</button>
       </div>
+      <p class="hint" style="font-size:12px;color:#8b949e;margin:8px 0 0;">诊断包含系统盘占用、内核目录明细与日志，全部只读采集，可发给作者排障；不含任何密码。</p>
       <details class="logbox" id="log-details" hidden>
         <summary>运行日志</summary>
         <pre id="full-log"></pre>
@@ -171,7 +173,7 @@
   </details>
 
   <footer class="aboutline" aria-label="作者信息">
-    <span class="who">系统盘清理助手 v1.5.5</span>
+    <span class="who">系统盘清理助手 v1.5.6</span>
     <span>作者：<b>很多问题的小明同学</b></span>
     <span id="qrTrigger" class="qr-trigger" role="button" tabindex="0"
           title="点击查看公众号二维码">公众号：<b>很多问题的小明同学</b></span>
@@ -205,6 +207,6 @@
   </div>
 </div>
 
-<script src="app.js?v=10"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>

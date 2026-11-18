@@ -357,7 +357,7 @@ def main():
                'PASS' if co_ok else 'FAIL'))
     except Exception as e:
         print('CACHE_ONLY: TEST_CRASH %r -> FAIL' % (e,))
-    # ===== v1.5.5 新增场景 =====
+    # ===== v1.5.5+ 新增场景 =====
     print()
     print('=== v1.5.5 NEW CHECKS ===')
     new_checks = [

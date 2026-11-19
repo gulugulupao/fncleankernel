@@ -276,6 +276,95 @@ def e4_phase_status_check():
                     R.get('kernel_phase_status') == 'OK'))
 
 
+def access_log_check():
+    """v1.6.0：写请求被拒时记录 access.jsonl，字段完整 + 脱敏。"""
+    import threading
+    import urllib.request
+    import urllib.error
+    import tempfile
+    from http.server import ThreadingHTTPServer
+
+    spec2 = importlib.util.spec_from_file_location('kcweb_al', APP + '/web/server.py')
+    srv = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(srv)
+    # 隔离到临时目录
+    srv.VAR = tempfile.mkdtemp(prefix='accesslog_')
+    srv.ACCESS_LOG = srv.VAR + '/access.jsonl'
+
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), srv.Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({'items': ['apt_cache'], 'confirm': True}).encode()
+        req = urllib.request.Request(
+            'http://127.0.0.1:%d/api/clean' % port, data=body, method='POST',
+            headers={'Content-Type': 'application/json',
+                     'X-Fnclean-Client': 'web',
+                     'Host': 'evil.example',
+                     'Origin': 'https://evil.example',
+                     'Sec-Fetch-Site': 'same-origin'})
+        try:
+            urllib.request.urlopen(req, timeout=8)
+        except urllib.error.HTTPError:
+            pass
+        rows = srv._read_access_log(limit=5)
+        ok = bool(rows)
+        if rows:
+            r = rows[0]
+            ok = ok and r.get('reason') == 'Host 不在允许列表'
+            ok = ok and r.get('host') == 'evil.example'
+            ok = ok and r.get('origin') == 'https://evil.example'
+            ok = ok and r.get('path') == '/api/clean'
+            ok = ok and bool(r.get('time')) and bool(r.get('client'))
+        return dict(ok=ok, rows=len(rows), sample=rows[0] if rows else {})
+    finally:
+        httpd.shutdown()
+
+
+def app_logs_e2e_check():
+    """v1.5.9 全链路：HTTP POST app_logs 经白名单后必须透传到引擎参数。
+
+    覆盖上版盲区：app_log_safety_check 直接调引擎函数，绕过了 server.py 的
+    ALLOWED_ITEMS 过滤；这里 mock run_engine 捕获真实 args，确保 app_logs
+    从前端 POST 一路到引擎不被静默丢弃。mock 掉引擎，不触发真实清理。"""
+    import threading
+    import urllib.request
+    import urllib.error
+    from http.server import ThreadingHTTPServer
+
+    spec2 = importlib.util.spec_from_file_location('kcweb_e2e', APP + '/web/server.py')
+    srv = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(srv)
+
+    captured = {}
+
+    def fake_run_engine(args, timeout=180):
+        captured['args'] = args
+        return dict(status='CACHE_ONLY', status_text='ok', log=[], warnings=[])
+
+    srv.run_engine = fake_run_engine
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), srv.Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({'items': ['app_logs'], 'confirm': True}).encode('utf-8')
+        req = urllib.request.Request(
+            'http://127.0.0.1:%d/api/clean' % port, data=body, method='POST',
+            headers={'Content-Type': 'application/json',
+                     'X-Fnclean-Client': 'web',
+                     'Sec-Fetch-Site': 'same-origin'})
+        try:
+            code = urllib.request.urlopen(req, timeout=8).status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        args = captured.get('args', [])
+        passed = (code == 200 and
+                  any('app_logs' in str(a) for a in args))
+        return dict(ok=passed, code=code, args=args)
+    finally:
+        httpd.shutdown()
+
+
 def host_whitelist_check():
     """v1.5.8：飞牛官方域名默认可信，攻击域名仍拒（DNS rebinding 防护保留）。"""
     spec2 = importlib.util.spec_from_file_location(
@@ -450,6 +539,8 @@ def main():
         ('E3 force scan', e3_force_scan_check),
         ('v1.5.7 app-log safety', app_log_safety_check),
         ('v1.5.8 host whitelist', host_whitelist_check),
+        ('v1.5.9 app_logs e2e', app_logs_e2e_check),
+        ('v1.6.0 access log', access_log_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

@@ -13,6 +13,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WEB = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +31,12 @@ VAR = os.environ.get('TRIM_PKGVAR') or '/vol1/@appdata/fncleankernel'
 STATE = os.path.join(VAR, 'last_result.json')
 HISTORY = os.path.join(VAR, 'history.jsonl')
 LOGFILE = os.path.join(VAR, 'log', 'clean.log')
+# v1.6.0：写接口被拒的结构化访问日志。403 发生在引擎之外，clean.log /
+# history.jsonl 都覆盖不到，导致"请求被拒绝"事后无任何痕迹可查。
+# 只记录被拒请求（成功的不记，避免噪音）；诊断包只读汇总最近若干条。
+ACCESS_LOG = os.path.join(VAR, 'access.jsonl')
+ACCESS_LOCK = threading.Lock()
+ACCESS_MAX = 200
 PORT = int(os.environ.get('SERVICE_PORT') or
            os.environ.get('TRIM_SERVICE_PORT') or 8097)
 # 飞牛应用中心 ui/config 是 type:url + protocol:http + port:8097，
@@ -101,8 +109,11 @@ def _local_hosts():
 LOCAL_HOSTS = _local_hosts()
 
 # 清理项白名单：前端传来的 items 只认这几个，其余静默丢弃
+# v1.5.9：补上 app_logs（第三方应用大日志）——v1.5.7 引入该清理项时
+# 只改了前端与引擎，漏了这里，导致勾选后被静默丢弃、引擎收到空项报 NO_TARGET。
 ALLOWED_ITEMS = {'old_kernel', 'apt_cache', 'syslog_rotated',
-                 'log_force_rotate', 'cron_mail', 'mon_residue', 'journal'}
+                 'log_force_rotate', 'cron_mail', 'mon_residue', 'journal',
+                 'app_logs'}
 
 # 静态资源白名单：只放行这几个文件，杜绝目录穿越
 STATIC = {
@@ -136,6 +147,60 @@ def run_engine(args, timeout=1300):
     except Exception as e:
         return dict(status='ERROR', status_text='引擎启动失败',
                     warnings=[repr(e)], log=[], grub=dict(executed=False))
+
+
+def _redact(value):
+    """访问日志脱敏：Host/Origin 保留可读域名，但去掉 userinfo 与超长串。"""
+    if not value:
+        return ''
+    v = str(value)
+    v = re.sub(r'(://)[^/@]+@', r'\1<已脱敏>@', v)   # URL 里的 user:pass@
+    v = re.sub(r'([A-Za-z0-9+/]{40,}={0,2})', '<长串已脱敏>', v)
+    return v[:300]
+
+
+def _log_denied(handler, reason):
+    """v1.6.0：记录一条被拒的写请求，供事后排查"为什么点清理没反应"。
+
+    只记录拒绝，不记成功（成功走引擎 clean.log），避免日志噪音。
+    字段：时间、方法、路径、Host、Origin、Sec-Fetch-Site、客户端、原因。
+    全程 try/except：日志失败绝不影响主请求的处理。"""
+    try:
+        row = dict(
+            time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            method=getattr(handler, 'command', ''),
+            path=(getattr(handler, 'path', '') or '').split('?')[0],
+            host=_redact(handler.headers.get('Host')),
+            origin=_redact(handler.headers.get('Origin')),
+            sec=(handler.headers.get('Sec-Fetch-Site') or '').lower(),
+            client=(getattr(handler, 'client_address', ('', 0)) or [''])[0],
+            reason=reason)
+        with ACCESS_LOCK:
+            os.makedirs(os.path.dirname(ACCESS_LOG), exist_ok=True)
+            lines = []
+            if os.path.exists(ACCESS_LOG):
+                with open(ACCESS_LOG, 'r', encoding='utf-8') as f:
+                    lines = f.read().splitlines()[-ACCESS_MAX + 1:]
+            lines.append(json.dumps(row, ensure_ascii=False))
+            tmp = ACCESS_LOG + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+            os.replace(tmp, ACCESS_LOG)
+    except Exception:
+        pass
+
+
+def _read_access_log(limit=30):
+    """读最近的被拒写请求记录（诊断包用），倒序返回，失败返回空。"""
+    try:
+        with ACCESS_LOCK:
+            if not os.path.exists(ACCESS_LOG):
+                return []
+            with open(ACCESS_LOG, 'r', encoding='utf-8') as f:
+                rows = [json.loads(x) for x in f.read().splitlines() if x.strip()]
+        return rows[-limit:][::-1]
+    except Exception:
+        return []
 
 
 def _host_of(value):
@@ -194,7 +259,16 @@ class Handler(BaseHTTPRequestHandler):
            预检，本服务未实现 OPTIONS，浏览器不会发出实际请求。
         2) Sec-Fetch-Site：浏览器明确标记跨站时直接拒绝。
         3) Host / Origin 与可信主机集合比对（S1，挡 DNS rebinding）。
+
+        v1.6.0：任何拒绝都写一条 access.jsonl，事后可从诊断包看到
+        "谁在何时用什么 Host/Origin 撞了哪条规则"，解决被拒无痕迹的问题。
         """
+        ok, why = self._write_check()
+        if not ok:
+            _log_denied(self, why)
+        return ok, why
+
+    def _write_check(self):
         if (self.headers.get('X-Fnclean-Client') or '') != 'web':
             return False, '缺少同源标记（X-Fnclean-Client）'
         sec = (self.headers.get('Sec-Fetch-Site') or '').lower()
@@ -311,6 +385,10 @@ class Handler(BaseHTTPRequestHandler):
         D = run_engine(['--diagnose'], timeout=300)
         if not isinstance(D, dict) or 'sections' not in D:
             return self._json(dict(error='诊断采集失败', raw=str(D)[:500]), 500)
+        # v1.6.0：把 Web 层记录的"被拒写请求"并入诊断，事后可查
+        # "谁在何时用什么 Host/Origin 被哪条规则挡下"。引擎看不到这些 403。
+        access_rows = _read_access_log(limit=30)
+        D['access_log'] = access_rows
         buf = io.BytesIO()
         try:
             with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -335,6 +413,21 @@ class Handler(BaseHTTPRequestHandler):
                     for f in al.get('files', [])[:10]:
                         lines.append('  · %s  %s' % (f.get('size_str', ''),
                                                      f.get('path', '')))
+                lines.append('')
+                # 被拒写请求历史：排查"点了清理没反应"的关键证据
+                lines.append('===== 被拒写请求记录（最近 %d 条）=====' % len(access_rows))
+                if access_rows:
+                    for r in access_rows:
+                        lines.append('%s | %s %s | Host=%s | Origin=%s | '
+                                     'Sec-Fetch-Site=%s | 来自=%s | 原因=%s' % (
+                                         r.get('time', '-'), r.get('method', ''),
+                                         r.get('path', ''), r.get('host', '') or '-',
+                                         r.get('origin', '') or '-',
+                                         r.get('sec', '') or '-',
+                                         r.get('client', '') or '-',
+                                         r.get('reason', '')))
+                else:
+                    lines.append('(无记录 — 没有写请求被安全规则拦下)')
                 lines.append('')
                 for name in ['uname', 'os_version', 'uptime', 'date', 'df',
                              'df_k', 'df_inode', 'usr_top', 'var_top', 'usr_lib_top',
@@ -415,17 +508,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, 'not found', 'text/plain; charset=utf-8')
         # S4：所有写操作统一串行锁（原 fix-cron 无锁，与 clean 并发会竞态）
         if not BUSY.acquire(blocking=False):
+            _log_denied(self, '已有任务在执行（并发写被拒）')
             return self._json(dict(status='ERROR', status_text='已有任务在执行',
                                    warnings=['请等待上一次任务结束。'],
                                    log=[], grub=dict(executed=False)), 429)
         try:
             data = self._read_body()
             if data is None:
+                _log_denied(self, '请求体过大')
                 return self._send(413, 'body too large',
                                   'text/plain; charset=utf-8')
             if path_only == '/api/fix-cron-mail':
                 return self._fix_cron_with(data)
             if data.get('confirm') is not True:
+                _log_denied(self, '缺少执行确认')
                 return self._json(dict(status='ERROR',
                                        status_text='缺少执行确认',
                                        warnings=['请从应用页面执行清理。'],

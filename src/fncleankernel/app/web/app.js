@@ -491,10 +491,26 @@
     var phaseTip = (st === 'GRUB_FAILED' && phase && phase !== st)
       ? '（内核阶段：' + (PHASE_LABEL[phase] || phase) +
         '。引导刷新失败不改变这一结果，请先确认 grub.cfg 再决定是否重启。）' : '';
-    $('r-desc').textContent = (st === 'OK'
-      ? '选中项已处理完成；保留内核与锁定状态均已复核，引导配置已强制刷新。'
-      : (bad ? '详情见下方提示与日志；引导配置仍已按铁律强制刷新。' :
-        '本次没有内核包被删除，但已按要求强制刷新引导配置。')) + phaseTip;
+    // v1.6.0：描述必须与引导实际状态一致。此前 ERROR（如请求被拒、
+    // 引擎异常）也会显示"引导配置仍已强制刷新"，但 grub.executed=false
+    // 时引擎压根没启动、什么都没刷新——红字报错配绿字"已刷新"自相矛盾。
+    var grubExec = !!(R.grub && R.grub.executed);
+    var desc;
+    if (!grubExec && (st === 'ERROR' || st === 'NO_TARGET')) {
+      // 请求被拒 / 无任何可执行项：如实说没动系统
+      desc = '本次未执行清理，系统文件与引导配置均未改动。';
+    } else if (st === 'OK') {
+      desc = '选中项已处理完成；保留内核与锁定状态均已复核，引导配置已强制刷新。';
+    } else if (bad) {
+      desc = grubExec
+        ? '详情见下方提示与日志；引导配置已按铁律强制刷新。'
+        : '详情见下方提示与日志；本次未刷新引导配置。';
+    } else {
+      desc = grubExec
+        ? '本次没有内核包被删除，但已按要求强制刷新引导配置。'
+        : '本次没有内核包被删除，引导配置未刷新。';
+    }
+    $('r-desc').textContent = desc + phaseTip;
     pill(bad ? 'danger' : (mid ? 'warn' : 'ok'), R.status_text || st);
 
     var g = R.grub || {};

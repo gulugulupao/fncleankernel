@@ -703,9 +703,35 @@
   $('btn-clean').addEventListener('click', clean);
   $('btn-load-log').addEventListener('click', loadLog);
   $('btn-copy-diag').addEventListener('click', copyDiag);
+  // v1.6.1：Android WebView 里的 blob 下载常常静默失败（a.download + blob URL
+  // 在无 DownloadListener 的 WebView 里点了没反应）。检测 WebView/移动内嵌环境，
+  // 直接导航到带 Content-Disposition 的下载链接——浏览器和多数 App WebView
+  // 都会把它交给下载管理器；桌面浏览器继续走 fetch→blob，体验不变。
+  function inAppWebView() {
+    var ua = navigator.userAgent || '';
+    var standalone = (window.navigator.standalone === true ||
+                      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    // 飞牛 App 内嵌、或一般 App WebView（含 Android/iOS）：UA 里没有常规桌面标识
+    // 且带 Mobile，或明确是 *App*/WebView 标识
+    return /Mobile/i.test(ua) && !/MicroMessenger/i.test(ua);
+  }
   $('btn-export-diag').addEventListener('click', function () {
     var btn = $('btn-export-diag');
     btn.disabled = true;
+    if (inAppWebView()) {
+      // App WebView：直接走系统下载，避免 blob 静默失败
+      pill('busy', '正在采集诊断');
+      var frame = document.createElement('iframe');
+      frame.style.display = 'none';
+      frame.src = '/api/diagnose?download=1&t=' + Date.now();
+      document.body.appendChild(frame);
+      setTimeout(function () {
+        if (frame.parentNode) frame.parentNode.removeChild(frame);
+        btn.disabled = false;
+        pill('ok', '诊断包已发起下载（在 App 的下载/文件中查看）');
+      }, 1500);
+      return;
+    }
     pill('busy', '正在采集诊断');
     fetch('/api/diagnose', { cache: 'no-store' })
       .then(function (r) {

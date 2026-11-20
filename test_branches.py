@@ -276,6 +276,67 @@ def e4_phase_status_check():
                     R.get('kernel_phase_status') == 'OK'))
 
 
+def webview_origin_check():
+    """v1.6.1：Android WebView 的 Origin:null 放行，攻击域名仍拒。"""
+    import threading
+    import urllib.request
+    import urllib.error
+    import tempfile
+    from http.server import ThreadingHTTPServer
+
+    spec2 = importlib.util.spec_from_file_location('kcweb_wv', APP + '/web/server.py')
+    srv = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(srv)
+    srv.VAR = tempfile.mkdtemp(prefix='webview_')
+    srv.ACCESS_LOG = srv.VAR + '/access.jsonl'
+    captured = {}
+
+    def fake(args, timeout=180):
+        captured['args'] = args
+        return dict(status='CACHE_ONLY', status_text='ok', log=[], warnings=[])
+
+    srv.run_engine = fake
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), srv.Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def post(origin):
+        body = json.dumps({'items': ['apt_cache'], 'confirm': True}).encode()
+        h = {'Content-Type': 'application/json', 'X-Fnclean-Client': 'web',
+             'Sec-Fetch-Site': 'same-origin'}
+        if origin is not None:
+            h['Origin'] = origin
+        req = urllib.request.Request('http://127.0.0.1:%d/api/clean' % port,
+                                     data=body, method='POST', headers=h)
+        try:
+            return urllib.request.urlopen(req, timeout=8).status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        # WebView: Origin null -> 越过来源校验，因 test 带 confirm 会走到引擎
+        captured.clear()
+        code_null = post('null')
+        ok_null = (code_null == 200 and
+                   captured.get('args') == ['--clean', '--items=apt_cache'])
+        # 攻击域名仍拒
+        captured.clear()
+        code_evil = post('https://evil.example')
+        ok_evil = (code_evil == 403 and not captured.get('args'))
+        # 官方域名仍放行
+        captured.clear()
+        code_official = post('https://app123.fnos.net')
+        ok_official = (code_official == 200 and bool(captured.get('args')))
+        # 无 Origin（curl 基线）仍放行
+        captured.clear()
+        code_none = post(None)
+        ok_none = (code_none == 200 and bool(captured.get('args')))
+        return dict(ok=all([ok_null, ok_evil, ok_official, ok_none]),
+                    null=ok_null, evil=ok_evil, official=ok_official, none=ok_none)
+    finally:
+        httpd.shutdown()
+
+
 def access_log_check():
     """v1.6.0：写请求被拒时记录 access.jsonl，字段完整 + 脱敏。"""
     import threading
@@ -541,6 +602,7 @@ def main():
         ('v1.5.8 host whitelist', host_whitelist_check),
         ('v1.5.9 app_logs e2e', app_logs_e2e_check),
         ('v1.6.0 access log', access_log_check),
+        ('v1.6.1 webview origin', webview_origin_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

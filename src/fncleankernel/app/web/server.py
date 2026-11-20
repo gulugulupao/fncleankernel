@@ -279,9 +279,14 @@ class Handler(BaseHTTPRequestHandler):
             return False, 'Host 不在允许列表'
         origin = self.headers.get('Origin')
         if origin:
-            if not _trusted_host(origin):
+            # v1.6.1：飞牛 App 的 Android WebView 从本地上下文加载页面时，
+            # fetch 会带 Origin: null（这是 WebView 的标准行为，不是攻击）。
+            # null 放行不会破坏 DNS rebinding 防护：那种攻击的 Origin 是
+            # evil.example 这类真实域名、不是 null，仍会被 _trusted_host 挡下；
+            # 而且前两道（X-Fnclean-Client 自定义头 + Sec-Fetch-Site）照样生效。
+            if origin.strip().lower() != 'null' and not _trusted_host(origin):
                 return False, 'Origin 不在允许列表'
-            if sec != 'same-origin':
+            if origin.strip().lower() != 'null' and sec != 'same-origin':
                 oh = _host_of(origin)
                 hh = _host_of(host)
                 if oh and hh and oh != hh:

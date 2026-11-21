@@ -76,25 +76,36 @@
       else if (rows[i].path === '/var') varKb += k;
       else other += k;
     }
-    var free = Math.max(0, total - usr - varKb - other);
-    function seg(cls, kb, name) {
+    // v1.6.2：free 必须用引擎从 df 读到的 avail_kb，不能用 total - du 之和。
+    // du 统计的是文件逻辑占用，btrfs 的块分配/稀疏文件会让它远大于 df 的实际
+    // 可用量；此前在 OES 上 du 合计 6.12G/总 6.15G，算出"可用 27MB"，而 df
+    // 真实可用 1.48G，构成条显示几乎满、误导用户。
+    var free = Number(b.avail_kb);
+    if (!isFinite(free) || free < 0) free = Math.max(0, total - usr - varKb - other);
+    if (free > total) free = total;
+    var duSum = usr + varKb + other;
+    // 条形宽度：free 用 df 真值；du 三段按比例缩放到"已用"额度(total-free)，
+    // 保证四段相加恰好 100%（否则 du 之和 + free 会超过 total 导致溢出）。
+    var usedReal = Math.max(0, total - free);
+    var scale = duSum > 0 ? usedReal / duSum : 0;
+    function seg(cls, kb, name, widthKb) {
       return '<div class="seg ' + cls + '" style="width:' +
-        (Math.max(0, kb) / total * 100).toFixed(2) + '%" title="' +
+        (Math.max(0, widthKb) / total * 100).toFixed(2) + '%" title="' +
         esc(name) + ' ' + mb(kb) + '"></div>';
     }
     $('breakdown-bar').innerHTML =
-      seg('seg-usr', usr, '/usr 系统本体') +
-      seg('seg-var', varKb, '/var 日志与缓存') +
-      seg('seg-other', other, '其它系统目录') +
-      seg('seg-free', free, '可用空间');
+      seg('seg-usr', usr, '/usr 系统本体', usr * scale) +
+      seg('seg-var', varKb, '/var 日志与缓存', varKb * scale) +
+      seg('seg-other', other, '其它系统目录', other * scale) +
+      seg('seg-free', free, '可用空间', free);
     $('bar-label').innerHTML = '系统盘共 <b>' + mb(total) + '</b> · 已用 <b>' +
-      mb(total - free) + '</b> · 可用 <b>' + mb(free) + '</b>。其中 <b>/usr 占 ' +
-      Math.round(usr / total * 100) + '%</b>，是系统本体，任何清理项都不会动它。';
+      mb(usedReal) + '</b> · 可用 <b>' + mb(free) + '</b>。其中 <b>/usr 占 ' +
+      mb(usr) + '</b>（按文件计），是系统本体，任何清理项都不会动它。';
     $('breakdown-legend').innerHTML =
       '<span class="legend-item"><i class="swatch seg-usr"></i>/usr ' + mb(usr) + '</span>' +
       '<span class="legend-item"><i class="swatch seg-var"></i>/var ' + mb(varKb) + '</span>' +
       '<span class="legend-item"><i class="swatch seg-other"></i>其它 ' + mb(other) + '</span>' +
-      '<span class="legend-item"><i class="swatch seg-free"></i>可用 ' + mb(free) + '</span>';
+      '<span class="legend-item"><i class="swatch seg-free"></i>可用 ' + mb(free) + '（df 实测）</span>';
   }
 
   /* ===== A2 更新前预检 ===== */
@@ -398,7 +409,17 @@
       pill('warn', '复制失败');
     }
     document.body.removeChild(ta);
-    setTimeout(function () { pill('', '内核已是最新'); }, 2500);
+    // v1.6.2：此前这里写死 pill('', '内核已是最新')，有旧内核时会误报"已是最新"。
+    // 恢复成与当前扫描一致的状态（同 renderScan 末尾口径）。
+    setTimeout(function () {
+      if (lastScan) {
+        var olds = (lastScan.kernels || []).filter(function (k) {
+          return k.action === 'remove';
+        });
+        var pl = lastScan.purge_list || [];
+        pill('', pl.length ? '发现 ' + olds.length + ' 个旧内核' : '内核已是最新');
+      }
+    }, 2500);
   }
 
   function renderBoot(R) {
@@ -703,51 +724,49 @@
   $('btn-clean').addEventListener('click', clean);
   $('btn-load-log').addEventListener('click', loadLog);
   $('btn-copy-diag').addEventListener('click', copyDiag);
-  // v1.6.1：Android WebView 里的 blob 下载常常静默失败（a.download + blob URL
-  // 在无 DownloadListener 的 WebView 里点了没反应）。检测 WebView/移动内嵌环境，
-  // 直接导航到带 Content-Disposition 的下载链接——浏览器和多数 App WebView
-  // 都会把它交给下载管理器；桌面浏览器继续走 fetch→blob，体验不变。
+  // v1.6.2：统一用 fetch 等服务端采集真正完成（诊断要几十秒，早前 WebView 分支
+  // 用 iframe + 固定 1.5s 定时器，采集没完就报"已发起下载"，是假成功）。
+  // 拿到 blob 后：优先用系统分享（App WebView 里最可靠），否则 a.download；
+  // 都不支持则明确提示用"复制诊断信息"兜底，不再谎报成功。
   function inAppWebView() {
     var ua = navigator.userAgent || '';
     var standalone = (window.navigator.standalone === true ||
                       (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
-    // 飞牛 App 内嵌、或一般 App WebView（含 Android/iOS）：UA 里没有常规桌面标识
-    // 且带 Mobile，或明确是 *App*/WebView 标识
-    return /Mobile/i.test(ua) && !/MicroMessenger/i.test(ua);
+    return standalone || (/Mobile/i.test(ua) && !/MicroMessenger/i.test(ua));
   }
   $('btn-export-diag').addEventListener('click', function () {
     var btn = $('btn-export-diag');
     btn.disabled = true;
-    if (inAppWebView()) {
-      // App WebView：直接走系统下载，避免 blob 静默失败
-      pill('busy', '正在采集诊断');
-      var frame = document.createElement('iframe');
-      frame.style.display = 'none';
-      frame.src = '/api/diagnose?download=1&t=' + Date.now();
-      document.body.appendChild(frame);
-      setTimeout(function () {
-        if (frame.parentNode) frame.parentNode.removeChild(frame);
-        btn.disabled = false;
-        pill('ok', '诊断包已发起下载（在 App 的下载/文件中查看）');
-      }, 1500);
-      return;
-    }
-    pill('busy', '正在采集诊断');
+    pill('busy', '正在采集诊断（约需几十秒）');
     fetch('/api/diagnose', { cache: 'no-store' })
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.blob();
       })
       .then(function (blob) {
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        a.href = url;
-        a.download = 'fncleankernel-diagnose.zip';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
-        pill('ok', '诊断包已导出');
+        var file = new File([blob], 'fncleankernel-diagnose.zip',
+                            { type: 'application/zip' });
+        // App/WebView：优先系统分享面板，用户可存到文件/发给作者
+        if (inAppWebView() && navigator.canShare && navigator.canShare({ files: [file] })) {
+          return navigator.share({ files: [file], title: '诊断包' }).then(function () {
+            pill('ok', '诊断包已生成，请在分享面板中保存或发送');
+          });
+        }
+        // 桌面/普通浏览器：a.download
+        if (!inAppWebView()) {
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = 'fncleankernel-diagnose.zip';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
+          pill('ok', '诊断包已导出');
+          return;
+        }
+        // WebView 既无分享也无下载能力：如实说明，给兜底路径
+        pill('warn', '诊断包已生成，但此 App 不支持直接保存；请用「复制诊断信息」发给作者');
       })
       .catch(function (e) { pill('danger', '导出失败：' + String(e)); })
       .finally(function () { btn.disabled = false; });

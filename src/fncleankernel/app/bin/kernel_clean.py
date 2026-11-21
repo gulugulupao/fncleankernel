@@ -413,21 +413,28 @@ def _append_history(R):
                grub_rc=R['grub']['rc'])
     try:
         os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
-        fh = open(HISTORY, 'a+', encoding='utf-8')
+        # E5 修正(v1.6.2)：锁必须加在「永远不被 replace 的独立锁文件」上。
+        # 此前锁的是 HISTORY 自身的 fd，而 _atomic_write 用 os.replace 把
+        # HISTORY 换成新 inode，锁留在旧 inode 上，无法保护替换后的文件——
+        # Web 清理与 CLI kclean 并发时会丢一条历史记录。
+        lock_path = HISTORY + '.lock'
+        lh = open(lock_path, 'a+', encoding='utf-8')
         try:
             if fcntl:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            fh.seek(0)
-            lines = fh.read().splitlines()[-199:]
+                fcntl.flock(lh.fileno(), fcntl.LOCK_EX)
+            lines = []
+            if os.path.exists(HISTORY):
+                with open(HISTORY, 'r', encoding='utf-8') as f:
+                    lines = f.read().splitlines()[-199:]
             lines.append(json.dumps(row, ensure_ascii=False))
             _atomic_write(HISTORY, '\n'.join(lines) + '\n')
         finally:
             if fcntl:
                 try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lh.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
-            fh.close()
+            lh.close()
     except Exception as e:
         R.setdefault('errors', []).append('write history: %r' % e)
 
@@ -1467,6 +1474,10 @@ def do_clean(dry=False, items=None):
         R['status'] = 'ERROR'
         note(R, traceback.format_exc()[-2000:], 'warnings')
     finally:
+        # v1.6.2：内核阶段原始状态必须在 cache_clean 之前抓取。
+        # 此前在铁律段才读 R['status']，此时已被缓存阶段改写成 OK/CACHE_FAILED，
+        # 叠加 GRUB 失败时前端会把"没删任何内核"显示成"内核阶段：清理成功"。
+        kernel_phase = R['status']
         # ===== EMMC 缓存阶段：勾选才执行，异常也不阻断下面的铁律 =====
         if not dry:
             try:
@@ -1481,9 +1492,10 @@ def do_clean(dry=False, items=None):
         # 内容前后逐字节一致；跳过可避免无意义写盘、约 3.7s 耗时，
         # 以及把零风险的缓存清理污染成 GRUB_FAILED。用户 2026-11-13 拍板。
         if not dry and do_kernel:
-            # E4：先记下内核阶段原始状态，GRUB 失败覆盖 status 时不再丢失
+            # E4：内核阶段原始状态，GRUB 失败覆盖 status 时不再丢失
             # 「部分成功 / 安全中止」的信息，历史与前端都能看到。
-            R['kernel_phase_status'] = R['status']
+            # v1.6.2：用 finally 开头抓的 kernel_phase，不受缓存阶段改写影响。
+            R['kernel_phase_status'] = kernel_phase
             rc_g, out_g = run_update_grub()
             R['grub'] = dict(executed=True, forced=True, rc=rc_g, output=out_g,
                              note='无条件执行（涉及内核包变更，无论清理结果如何）')

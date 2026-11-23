@@ -239,8 +239,13 @@ def ssh_info():
     enabled = out2.strip() in ('enabled', 'alias', 'enabled-runtime', 'static')
     rc3, out3, _ = sh(['ss', '-tln'], timeout=30)
     port22 = bool(re.search(r':22\s', out3))
-    ok = active and port22
-    return dict(active=active, enabled=enabled, port22=port22, ok=ok,
+    # v1.6.3：SSH 是否可用只看服务状态，不看端口。此前 ok = active and port22，
+    # 用户把 SSH 改成非 22 端口后服务明明是 active 的，却误报「SSH 未开启」。
+    # 这个字段的用途只是提示"异常时能否远程排障"，任何端口都能连，端口是多少
+    # 不影响该判断。顺便从 ss 输出里提取实际监听端口，供界面如实展示。
+    ports = sorted(set(re.findall(r':(\d{2,5})\s', out3)))
+    ok = active
+    return dict(active=active, enabled=enabled, port22=port22, ports=ports, ok=ok,
                 hint='' if ok else 'SSH 未开启：请在 飞牛 OS「设置 → 终端/SSH」中手动开启，'
                                   '以便清理出现异常时可以从电脑远程进入设备排障。')
 

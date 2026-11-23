@@ -166,6 +166,11 @@ def _log_denied(handler, reason):
     字段：时间、方法、路径、Host、Origin、Sec-Fetch-Site、客户端、原因。
     全程 try/except：日志失败绝不影响主请求的处理。"""
     try:
+        # v1.6.3：补 UA 与关键头的有无标记——这是判断"是不是 App 内置浏览器"
+        # 的决定性证据。此前只有 Host/Origin/Sec，遇到 App 里报"Host 不在允许
+        # 列表"时无法区分 Origin 是无、是 null、还是别的，只能猜。
+        def has(name):
+            return handler.headers.get(name) is not None
         row = dict(
             time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             method=getattr(handler, 'command', ''),
@@ -174,7 +179,11 @@ def _log_denied(handler, reason):
             origin=_redact(handler.headers.get('Origin')),
             sec=(handler.headers.get('Sec-Fetch-Site') or '').lower(),
             client=(getattr(handler, 'client_address', ('', 0)) or [''])[0],
-            reason=reason)
+            reason=reason,
+            ua=_redact(handler.headers.get('User-Agent')),
+            headers_present=dict(
+                origin=has('Origin'), sec=has('Sec-Fetch-Site'),
+                referer=has('Referer'), custom=has('X-Fnclean-Client')))
         with ACCESS_LOCK:
             os.makedirs(os.path.dirname(ACCESS_LOG), exist_ok=True)
             lines = []
@@ -274,16 +283,20 @@ class Handler(BaseHTTPRequestHandler):
         sec = (self.headers.get('Sec-Fetch-Site') or '').lower()
         if sec and sec not in ('same-origin', 'none'):
             return False, '跨站请求被拒绝（Sec-Fetch-Site=%s）' % sec
-        host = self.headers.get('Host') or ''
-        if host and not _trusted_host(host):
-            return False, 'Host 不在允许列表'
         origin = self.headers.get('Origin')
+        # v1.6.3：Host / Origin 白名单的正确定位是「挡 DNS rebinding」，即恶意
+        # 站点把域名解析到 NAS 内网 IP 后诱导浏览器发请求——那种请求的 Origin
+        # 一定是攻击者的真实域名（evil.example）。而飞牛 App 内置浏览器（Android
+        # WebView）从本地/私有上下文加载页面时，Origin 是 null 或干脆不发，Host
+        # 也可能是 App 私有入口——它不是攻击，却会因 Host 白名单被误拒（截图
+        # 「Host 不在允许列表」）。
+        #
+        # 判定：前两道（X-Fnclean-Client 自定义头 + Sec-Fetch-Site 非跨站）已挡住
+        # 跨站攻击；这里只需拦「明确带恶意 Origin」的情况。App WebView 特征：
+        # Origin 缺失或为 null；此时即便 Host 不是标准地址也放行。
+        app_context = (not origin) or (origin.strip().lower() == 'null')
+        host = self.headers.get('Host') or ''
         if origin:
-            # v1.6.1：飞牛 App 的 Android WebView 从本地上下文加载页面时，
-            # fetch 会带 Origin: null（这是 WebView 的标准行为，不是攻击）。
-            # null 放行不会破坏 DNS rebinding 防护：那种攻击的 Origin 是
-            # evil.example 这类真实域名、不是 null，仍会被 _trusted_host 挡下；
-            # 而且前两道（X-Fnclean-Client 自定义头 + Sec-Fetch-Site）照样生效。
             if origin.strip().lower() != 'null' and not _trusted_host(origin):
                 return False, 'Origin 不在允许列表'
             if origin.strip().lower() != 'null' and sec != 'same-origin':
@@ -291,6 +304,10 @@ class Handler(BaseHTTPRequestHandler):
                 hh = _host_of(host)
                 if oh and hh and oh != hh:
                     return False, 'Origin 与 Host 不一致'
+        # 只有「非 App 上下文」（带可信真实 Origin 的普通浏览器）才严格要求
+        # Host 也在白名单；App WebView（无 Origin / null）跳过 Host 校验。
+        if not app_context and host and not _trusted_host(host):
+            return False, 'Host 不在允许列表'
         return True, ''
 
     def _get_allowed(self):
@@ -431,6 +448,11 @@ class Handler(BaseHTTPRequestHandler):
                                          r.get('sec', '') or '-',
                                          r.get('client', '') or '-',
                                          r.get('reason', '')))
+                        hp = r.get('headers_present') or {}
+                        lines.append('    头携带: Origin=%s Sec=%s Referer=%s 自定义=%s | UA=%s' % (
+                            hp.get('origin', '?'), hp.get('sec', '?'),
+                            hp.get('referer', '?'), hp.get('custom', '?'),
+                            r.get('ua', '') or '-'))
                 else:
                     lines.append('(无记录 — 没有写请求被安全规则拦下)')
                 lines.append('')
@@ -505,8 +527,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         ok, why = self._write_allowed()
         if not ok:
+            # v1.6.3：拒绝原因后附 Host/Origin 实值（脱敏），用户直接截图即可
+            # 提供排障证据，不必再导出诊断包——之前有用户只发截图没诊断包，
+            # 导致只能猜是哪个来源字段被拒。
+            diag = 'Host=%s；Origin=%s' % (
+                _redact(self.headers.get('Host')) or '(未发送)',
+                _redact(self.headers.get('Origin')) or '(未发送)')
             return self._json(dict(status='ERROR', status_text='请求被拒绝',
-                                   warnings=[why], log=[],
+                                   warnings=[why, '诊断信息：' + diag], log=[],
                                    grub=dict(executed=False)), 403)
         path_only = self.path.split('?')[0]
         if path_only not in ('/api/fix-cron-mail', '/api/clean'):

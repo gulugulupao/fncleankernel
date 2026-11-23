@@ -276,6 +276,66 @@ def e4_phase_status_check():
                     R.get('kernel_phase_status') == 'OK'))
 
 
+def ssh_port_check():
+    """v1.6.3：SSH 服务 active 但端口非 22 时不应误报未开启。"""
+    def fake_sh(argv, timeout=30):
+        cmd = ' '.join(argv)
+        if 'is-active' in cmd:
+            return 0, 'active\n', ''
+        if 'is-enabled' in cmd:
+            return 0, 'enabled\n', ''
+        if 'ss' in cmd and '-tln' in cmd:
+            # 模拟 SSH 改到 2222 端口，没有 22
+            return 0, ('State  Recv-Q Send-Q Local Address:Port\n'
+                       'LISTEN 0 128 0.0.0.0:2222\n'
+                       'LISTEN 0 128 127.0.0.1:8097\n'), ''
+        return 0, '', ''
+    old = kc.sh
+    kc.sh = fake_sh
+    try:
+        info = kc.ssh_info()
+        ok = (info.get('ok') is True and info.get('active') is True and
+              info.get('enabled') is True and '2222' in info.get('ports', []))
+        return dict(ok=ok, info=info)
+    finally:
+        kc.sh = old
+
+
+def app_host_check():
+    """v1.6.3：App WebView 私有 Host（null/无 Origin）放行，恶意 Origin 仍拒。"""
+    spec2 = importlib.util.spec_from_file_location('kcweb_ah', APP + '/web/server.py')
+    srv = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(srv)
+
+    class FakeHandler:
+        def __init__(self, host, origin, sec='same-origin', client='web'):
+            self.headers = {'Host': host, 'X-Fnclean-Client': client}
+            if origin is not None:
+                self.headers['Origin'] = origin
+            if sec is not None:
+                self.headers['Sec-Fetch-Site'] = sec
+            self.command = 'POST'
+            self.path = '/api/clean'
+            self.client_address = ('127.0.0.1', 0)
+
+    def check(host, origin, sec='same-origin', client='web'):
+        return srv.Handler._write_check(FakeHandler(host, origin, sec, client))
+
+    allow = [
+        check('some-app-internal', 'null'),
+        check('some-app-internal', None),
+        check('192.168.3.17:8097', 'https://192.168.3.17:8097'),
+    ]
+    deny = [
+        check('evil.example', 'https://evil.example'),
+        check('app123.fnos.net', 'https://evil.example'),
+        check('192.168.3.17:8097', 'https://evil.example', 'cross-site'),
+        check('192.168.3.17:8097', None, client='bad'),
+    ]
+    ok = all(x[0] for x in allow) and all(not x[0] for x in deny)
+    return dict(ok=ok, allow=[x[1] for x in allow], deny=[x[1] for x in deny])
+
+
 def webview_origin_check():
     """v1.6.1：Android WebView 的 Origin:null 放行，攻击域名仍拒。"""
     import threading
@@ -372,7 +432,7 @@ def access_log_check():
         ok = bool(rows)
         if rows:
             r = rows[0]
-            ok = ok and r.get('reason') == 'Host 不在允许列表'
+            ok = ok and r.get('reason') in ('Host 不在允许列表', 'Origin 不在允许列表')
             ok = ok and r.get('host') == 'evil.example'
             ok = ok and r.get('origin') == 'https://evil.example'
             ok = ok and r.get('path') == '/api/clean'
@@ -603,6 +663,8 @@ def main():
         ('v1.5.9 app_logs e2e', app_logs_e2e_check),
         ('v1.6.0 access log', access_log_check),
         ('v1.6.1 webview origin', webview_origin_check),
+        ('v1.6.3 ssh port', ssh_port_check),
+        ('v1.6.3 app host', app_host_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>浏览器能力自检 · 系统盘清理助手</title>
+<style>
+  body { margin: 0; padding: 18px; background: #f5f7fa; color: #24292f;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 15px; line-height: 1.5; }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #57606a; font-size: 13px; margin: 0 0 16px; }
+  .verdict { padding: 14px 16px; border-radius: 10px; margin-bottom: 16px;
+    font-size: 17px; font-weight: 600; background: #e6f4ea; color: #1a7f37;
+    border: 1px solid #b7e1c1; }
+  .verdict.bad { background: #fdecea; color: #c0392b; border-color: #f5c2bd; }
+  .card { background: #fff; border: 1px solid #d8dee4; border-radius: 10px;
+    padding: 4px 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 12px 0 8px; color: #0969da; }
+  .row { display: flex; align-items: baseline; justify-content: space-between;
+    padding: 7px 0; border-bottom: 1px solid #eef1f4; }
+  .row:last-child { border-bottom: 0; }
+  .name { flex: 1; }
+  .desc { color: #8b949e; font-size: 12px; margin-left: 8px; }
+  .val { font-weight: 600; margin-left: 12px; white-space: nowrap; }
+  .yes { color: #1a7f37; }
+  .no { color: #c0392b; }
+  .muted { color: #8b949e; font-weight: 400; }
+  .env { font-size: 13px; color: #57606a; word-break: break-all;
+    background: #f6f8fa; padding: 10px 12px; border-radius: 8px; }
+  .foot { font-size: 12px; color: #8b949e; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>浏览器能力自检</h1>
+  <p class="sub">系统盘清理助手 v1.7.0 · 请在各浏览器打开本页并截图</p>
+
+  <div id="verdict" class="verdict">检测中…</div>
+
+  <div class="card">
+    <h2>核心 API（影响功能可用性）</h2>
+    <div id="core"></div>
+  </div>
+
+  <div class="card">
+    <h2>导出路径（按当前环境判定）</h2>
+    <div id="share"></div>
+  </div>
+
+  <div class="card">
+    <h2>语法与渲染（兼容性参考）</h2>
+    <div id="render"></div>
+  </div>
+
+  <div class="card">
+    <h2>环境信息</h2>
+    <div class="env" id="env">读取中…</div>
+  </div>
+
+  <p class="foot">检测时间：<span id="now">-</span> · 本页只读，不采集或上传任何数据。</p>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  function $(id) { return document.getElementById(id); }
+  function yes(v) { return v ? '<span class="val yes">支持</span>'
+                             : '<span class="val no">不支持</span>'; }
+  function txt(v) { return '<span class="val">' + String(v) + '</span>'; }
+  function row(name, desc, html) {
+    return '<div class="row"><span class="name">' + name +
+      '<span class="desc">' + desc + '</span></span>' + html + '</div>';
+  }
+  function has(name) {
+    try { return typeof window[name] !== 'undefined'; } catch (e) { return false; }
+  }
+  function tryNew(name) {
+    try { return !!new window[name](); } catch (e) { return false; }
+  }
+
+  var missing = [];
+
+  // ---- 核心 API ----
+  var core = '';
+  var vPromise = has('Promise');
+  core += row('Promise', '异步基础', yes(vPromise));
+  if (!vPromise) missing.push('Promise');
+
+  var vFinally = false;
+  try { vFinally = !!(window.Promise && Promise.prototype.finally); } catch (e) {}
+  core += row('Promise.finally', 'v1.7 已加 polyfill', yes(vFinally));
+  if (!vFinally) missing.push('finally(有polyfill)');
+
+  var vFetch = has('fetch');
+  core += row('fetch', '所有接口请求', yes(vFetch));
+  if (!vFetch) missing.push('fetch');
+
+  var vBlob = has('Blob');
+  core += row('Blob', '诊断包文件', yes(vBlob));
+  if (!vBlob) missing.push('Blob');
+
+  var vFile = false;
+  try { vFile = typeof File !== 'undefined' && !!new File(['x'], 't.txt'); } catch (e) {}
+  core += row('File 构造函数', '系统分享用', yes(vFile));
+
+  var vObjectURL = false;
+  try { vObjectURL = !!(window.URL && URL.createObjectURL); } catch (e) {}
+  core += row('URL.createObjectURL', '诊断包下载', yes(vObjectURL));
+  if (!vObjectURL) missing.push('createObjectURL');
+
+  var vMatchMedia = has('matchMedia');
+  core += row('matchMedia', 'WebView 识别', yes(vMatchMedia));
+
+  var vConfirm = has('confirm');
+  core += row('window.confirm', '清理确认弹窗', yes(vConfirm));
+  if (!vConfirm) missing.push('confirm');
+
+  $('core').innerHTML = core;
+
+  // ---- 导出路径：统一走服务端附件链接（不靠 UA，不依赖 blob）----
+  // 与 app.js v1.7.1 一致：<a href="/api/diagnose" download> 标准导航下载
+  var share = '';
+  var ua = '';
+  try { ua = navigator.userAgent || ''; } catch (e) {}
+  var vDownload = false;
+  try { vDownload = 'download' in document.createElement('a'); } catch (e) {}
+
+  share += row('当前环境导出路径', '统一走服务端附件链接',
+    '<span class="val yes">/api/diagnose 直接下载</span>');
+
+  var vShare = false;
+  try { vShare = typeof navigator.share === 'function'; } catch (e) {}
+  var vCanShare = false;
+  try { vCanShare = (typeof navigator.canShare === 'function') &&
+                    navigator.canShare({ files: [] }); } catch (e) {}
+
+  // 以下三项当前都不参与导出，纯参考，中性显示不计入缺口
+  share += row('a[download] 属性', vDownload ? '已支持（锦上添花）' : '缺失不影响',
+    vDownload ? '<span class="val yes">支持</span>'
+              : '<span class="val muted">不支持 · 不影响</span>');
+  share += row('navigator.share', '不再使用（v1.7.1）',
+    vShare ? '<span class="val muted">支持 · 未使用</span>'
+           : '<span class="val muted">不支持 · 不影响</span>');
+  share += row('navigator.canShare', '不再使用（v1.7.1）',
+    vCanShare ? '<span class="val muted">支持 · 未使用</span>'
+              : '<span class="val muted">不支持 · 不影响</span>');
+  $('share').innerHTML = share;
+
+  // ---- 语法与渲染 ----
+  var render = '';
+  var vGrid = false;
+  try { vGrid = !!(window.CSS && CSS.supports && CSS.supports('display', 'grid')); } catch (e) {}
+  render += row('CSS Grid', '页面布局', yes(vGrid));
+
+  var vGap = false;
+  try { vGap = !!(window.CSS && CSS.supports && CSS.supports('gap', '10px')); } catch (e) {}
+  render += row('CSS gap', 'flex/grid 间距', yes(vGap));
+
+  var vVar = false;
+  try { vVar = !!(window.CSS && CSS.supports && CSS.supports('color', 'var(--x)')); } catch (e) {}
+  render += row('CSS 变量', '当前未使用', yes(vVar));
+
+  var vDetails = false;
+  try { vDetails = 'open' in document.createElement('details'); } catch (e) {}
+  render += row('details/summary', '折叠区块', yes(vDetails));
+  if (!vDetails) missing.push('details');
+
+  var vES6 = false;
+  try { vES6 = !!Function('return (()=>1)()'); } catch (e) {}
+  render += row('ES6 箭头函数', '代码未使用（仅参考）', yes(vES6));
+
+  render += row('屏幕宽度', '截图参考', txt(window.innerWidth + ' px'));
+  render += row('像素密度', '截图参考', txt(window.devicePixelRatio || 1));
+  $('render').innerHTML = render;
+
+  // ---- 环境信息 ----
+  var webview = '普通浏览器';
+  if (/MicroMessenger/i.test(ua)) webview = '微信内置浏览器';
+  else if (/Android/i.test(ua) && !/Chrome\/[3-9][0-9]/i.test(ua)) webview = '安卓浏览器（内核版本需看 UA）';
+  else if (/Android/i.test(ua)) webview = '安卓 Chrome/Chromium';
+  else if (/Windows|Macintosh/i.test(ua)) webview = '桌面浏览器';
+  $('env').innerHTML = '<b>环境判断：</b>' + webview + '<br><b>UA：</b>' + ua;
+
+  // ---- 结论 ----
+  var el = $('verdict');
+  if (missing.length) {
+    el.className = 'verdict bad';
+    el.innerHTML = '有 ' + missing.length + ' 项缺口：' + missing.join('、');
+  } else {
+    el.innerHTML = '核心能力齐全，可以正常使用全部功能';
+  }
+  $('now').textContent = new Date().toLocaleString();
+})();
+</script>
+</body>
+</html>

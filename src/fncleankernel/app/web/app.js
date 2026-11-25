@@ -668,48 +668,30 @@
   // 都不支持则如实提示换浏览器打开再导出，不再谎报成功。
   // v1.7：删掉"复制诊断信息"——完整诊断报告 8 万字符塞进剪贴板会被
   // 微信/输入法截断，反而误事；导出诊断包才是唯一可靠通道。
-  function inAppWebView() {
-    var ua = navigator.userAgent || '';
-    var standalone = (window.navigator.standalone === true ||
-                      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
-    return standalone || (/Mobile/i.test(ua) && !/MicroMessenger/i.test(ua));
-  }
+  // v1.7.1：删掉靠 UA 猜环境的判定，也删掉 fetch→blob→a.click() 的下载路径
+  // （飞牛 App WebView 拦截 blob:，实测弹「下载失败」）。改为统一走
+  // <a href="/api/diagnose" download> 标准导航下载，服务端直接流式返回 zip 附件。
   $('btn-export-diag').addEventListener('click', function () {
     var btn = $('btn-export-diag');
     btn.disabled = true;
     pill('busy', '正在采集诊断（约需几十秒）');
-    fetch('/api/diagnose', { cache: 'no-store' })
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.blob();
-      })
-      .then(function (blob) {
-        var file = new File([blob], 'fncleankernel-diagnose.zip',
-                            { type: 'application/zip' });
-        // App/WebView：优先系统分享面板，用户可存到文件/发给作者
-        if (inAppWebView() && navigator.canShare && navigator.canShare({ files: [file] })) {
-          return navigator.share({ files: [file], title: '诊断包' }).then(function () {
-            pill('ok', '诊断包已生成，请在分享面板中保存或发送');
-          });
-        }
-        // 桌面/普通浏览器：a.download
-        if (!inAppWebView()) {
-          var url = URL.createObjectURL(blob);
-          var a = document.createElement('a');
-          a.href = url;
-          a.download = 'fncleankernel-diagnose.zip';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(function () { URL.revokeObjectURL(url); }, 3000);
-          pill('ok', '诊断包已导出');
-          return;
-        }
-        // WebView 既无分享也无下载能力：如实说明，给兜底路径
-        pill('warn', '诊断包已生成，但此 App 不支持直接保存；请用浏览器打开本页再导出');
-      })
-      .catch(function (e) { pill('danger', '导出失败：' + String(e)); })
-      .finally(function () { btn.disabled = false; });
+
+    // v1.7.1 修复：飞牛 App 内置 WebView 会拦截 blob: 下载（用户实测弹「下载失败」）。
+    // 直接走 <a href="/api/diagnose" download> 的标准导航下载——服务端接口本身就带
+    // Content-Disposition: attachment，比 fetch→blob→a.click() 可靠得多。
+    // 一个临时链接元素即可，普通浏览器与 App WebView 都用同一条路。
+    var a = document.createElement('a');
+    a.href = '/api/diagnose';
+    a.download = 'fncleankernel-diagnose.zip';
+    document.body.appendChild(a);
+    try {
+      a.click();
+      pill('ok', '诊断包下载已开始；若 App 未弹出保存，请点右上角「···」用浏览器打开');
+    } catch (e) {
+      pill('danger', '下载启动失败：' + String(e));
+    }
+    document.body.removeChild(a);
+    setTimeout(function () { btn.disabled = false; }, 3000);
   });
   scan();
 })();

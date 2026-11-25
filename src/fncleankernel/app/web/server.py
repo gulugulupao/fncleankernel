@@ -119,6 +119,7 @@ ALLOWED_ITEMS = {'old_kernel', 'apt_cache', 'syslog_rotated',
 STATIC = {
     '/': 'index.html',
     '/index.html': 'index.html',
+    '/compat.html': 'compat.html',
     '/style.css': 'style.css',
     '/app.js': 'app.js',
     '/images/wechat-promo.png': 'images/wechat-promo.png',

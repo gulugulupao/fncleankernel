@@ -175,8 +175,8 @@ def fetch_and_verify(c, sftp, remote_fpk):
     for n in sorted(inner):
         print('   ', oct(modes.get(n, 0)), n)
     required = ['kernel_clean.py', 'kclean', 'server.py', 'index.html',
-                'app.js', 'style.css', 'ui/config', 'icon_64.png', 'icon_256.png',
-                'wechat-promo.png']
+                'compat.html', 'app.js', 'style.css', 'ui/config',
+                'icon_64.png', 'icon_256.png', 'wechat-promo.png']
     print('=== 关键文件核验 ===')
     for key in required:
         hit = [n for n in inner if key in n]

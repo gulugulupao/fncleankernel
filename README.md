@@ -5,14 +5,14 @@
 **通用 ARM 版飞牛 fnOS 的「系统盘体检 + 逐项清理」第三方应用 —— 给板载 EMMC 腾空间。**
 **与飞牛官方无关，是社区开发者做的小工具。**
 
-![版本](https://img.shields.io/badge/version-v1.7.0-blue)
+![版本](https://img.shields.io/badge/version-v1.7.1-blue)
 ![平台](https://img.shields.io/badge/platform-ARM%20fnOS-orange)
 ![许可](https://img.shields.io/badge/license-MIT%20%2B%20附加条款-green)
 ![设备](https://img.shields.io/badge/设备-OEC%20%2F%20OES-lightgrey)
 
 作者：[很多问题的小明同学](https://github.com/gulugulupao) · 公众号：很多问题的小明同学
 
-[下载安装包 v1.7.0](https://github.com/gulugulupao/fncleankernel/releases/download/v1.7.0/fncleankernel-V1.7.0.fpk) · [使用说明](使用说明.md) · [Release](https://github.com/gulugulupao/fncleankernel/releases)
+[下载安装包 v1.7.1](https://github.com/gulugulupao/fncleankernel/releases/download/v1.7.1/fncleankernel-V1.7.1.fpk) · [使用说明](使用说明.md) · [Release](https://github.com/gulugulupao/fncleankernel/releases)
 
 </div>
 
@@ -94,7 +94,7 @@
 
 ## 安装
 
-1. 到 [Releases](https://github.com/gulugulupao/fncleankernel/releases) 下载最新版 `fncleankernel-V1.7.0.fpk`（文件名带版本号，方便区分版本）。
+1. 到 [Releases](https://github.com/gulugulupao/fncleankernel/releases) 下载最新版 `fncleankernel-V1.7.1.fpk`（文件名带版本号，方便区分版本）。
 2. 飞牛桌面「应用中心」→ 右上角「手动安装」→ 选择该文件。
 3. 装好后点「系统盘清理助手」打开，手机浏览器也能用（页面自动排成窄屏版式）。
 
@@ -106,7 +106,7 @@
 <summary>📦 仓库内容</summary>
 
 ```
-fncleankernel-V1.7.0.fpk  构建好的安装包（文件名含版本号，与 Releases 中一致）
+fncleankernel-V1.7.1.fpk  构建好的安装包（文件名含版本号，与 Releases 中一致）
 src/fncleankernel/        应用源码（fpk 工程）：引擎 kernel_clean.py、Web 后端 server.py、前端、图标、脚本、manifest
 screenshots/              README 中展示的界面截图
 build_fpk.py              构建/部署脚本（上传工程 → 设备只读验证 → 设备上 fnpack build → 回传核验）

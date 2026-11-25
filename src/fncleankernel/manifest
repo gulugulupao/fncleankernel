@@ -1,5 +1,5 @@
 appname               = fncleankernel
-version               = 1.6.4
+version               = 1.7.0
 display_name          = 系统盘清理助手
 desc                  = 通用 ARM 飞牛 · 系统盘体检 + 逐项清理，给板载 EMMC 腾空间。<br><br>1.体检先行：空间构成条一眼看清 /usr 占了多少；更新前预检基于 OEC 真机实测的系统更新峰值（额外占用 1.11 GB）给出 1.29 GB 建议线；存储空间只读体检展示数据卷占用。<br>2.逐项勾选：旧内核、apt 缓存、日志轮转（含子目录）、活跃日志强制轮转、Cron 告警邮件，扫描时显示真机实测大小；中风险项需二次确认。<br>3.只清系统盘：清理项都作用于 / 所在文件系统，绝不碰数据卷；journal 实测在 tmpfs 内存盘，只作体检提示。<br>4.历史可查：每次清理落一条记录，趋势图 + 上次结果 + 完整日志 + 一键复制诊断信息。<br>5.引导刷新：涉及旧内核包变更时，无论清理成功 / 失败 / 无旧内核 / 内核被锁定，最后都强制执行 sudo update-grub；只清缓存时不触碰引导，自动跳过。<br><br>安全边界：保留当前内核与最新内核、hold 临时解锁与恢复、apt 预演白名单、u-boot 实引导断言全部保留。适用：网心云 OEC(RK3566) / OES(A311D) 等 ARM 版飞牛 fnOS。与飞牛官方无关。
 source                = thirdparty
@@ -12,4 +12,4 @@ desktop_applaunchname = fncleankernel.Application
 service_port          = 8097
 checkport             = true
 ctl_stop              = true
-changelog             = v1.6.4 诊断包大幅扩充：新增 7 天日志窗口（错误/警告级）、硬件参数（CPU/内存/SoC/机型/温度/存储/网络/GPU-NPU节点）、被拒日志关键词与负载进程；报告头部直接给出设备身份。v1.6.3
+changelog             = ★★ v1.7.0：诊断包与交互大升级。① 诊断包收录工具自身运行痕迹（clean.log 尾300行/last_result 关键字段/history 尾30条/tool_info）；② Web层异常落盘 web.log（5类+轮转）；报告加7天日志截断说明、采集异常置顶；③ 新增「安全自检」只读按钮（8项检查，不写状态）；④ 新增 dpkg --audit 半配置守卫（UNSAFE_PLAN）；⑤ 新增清理后回读验证（目标包消失/保留内核在/boot释放/grub刷新）；⑥ 修复老版 WebView 无 Promise.finally 导致按钮永久变灰；⑦ 删存储空间模块、历史区重复按钮、复制诊断信息、阈值依据折叠块（底层+web+CSS全清）。【以下为历史变更】

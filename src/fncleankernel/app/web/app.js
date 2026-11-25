@@ -1,6 +1,18 @@
 /* fncleankernel 前端 · 零依赖 */
 (function () {
   'use strict';
+  // v1.7：老版 Android WebView（飞牛 App 内置浏览器）没有 Promise.prototype.finally，
+  // 一旦调用就抛 TypeError，导致 .finally 里的按钮状态恢复永远不执行 —— 表现就是
+  // 「点一次安全自检/扫描/清理后按钮永久变灰，再点没反应」。补一个标准 polyfill。
+  if (typeof Promise !== 'undefined' && !Promise.prototype.finally) {
+    Promise.prototype.finally = function (onFinally) {
+      var P = this.constructor;
+      return this.then(
+        function (v) { return P.resolve(onFinally()).then(function () { return v; }); },
+        function (e) { return P.resolve(onFinally()).then(function () { throw e; }); }
+      );
+    };
+  }
   var $ = function (id) { return document.getElementById(id); };
   var lastScan = null;
 
@@ -122,7 +134,6 @@
     var pp = $('precheck-pill');
     pp.className = 'pill ' + (p.ok ? 'ok' : 'warn');
     pp.textContent = p.advice || '检查中';
-    $('precheck-note').textContent = p.note || '';
   }
 
   /* ===== 清理项逐项勾选 ===== */
@@ -270,42 +281,6 @@
     }).join('\n\n');
   }
 
-  /* ===== A4 数据卷只读体检 ===== */
-  function renderVolumes(R) {
-    var vols = R.volumes || [];
-    if (!vols.length) {
-      $('volume-list').innerHTML = '<div class="empty">未检测到数据卷</div>';
-      return;
-    }
-    var mon = null;
-    var ci = (R.cache_items || []);
-    for (var k = 0; k < ci.length; k++) {
-      if (ci[k].id === 'mon_residue') { mon = ci[k]; break; }
-    }
-    var prefix = '';
-    if (mon && mon.actionable && mon.bytes > 0) {
-      prefix = '<div class="volnote-box">检测到我们自己留下的监控产物 <b>' +
-        esc(mon.size_str) + '</b>（' + (mon.count || 0) +
-        ' 个条目）。这一项已获授权，可在上方「清理项」里勾选删除；' +
-        '本页其它内容仍全部只读。</div>';
-    }
-    $('volume-list').innerHTML = prefix + vols.map(function (v) {
-      var pct = Number(v.pcent) || 0;
-      var tops = (v.top || []).slice(0, 6).map(function (t) {
-        var parts = String(t.path).split('/');
-        return '<span>' + esc(parts[parts.length - 1] || t.path) +
-          ' <b>' + mb(t.kb) + '</b></span>';
-      }).join('');
-      return '<div class="volcard">' +
-        '<div class="volhd"><b>' + esc(v.mount) + '</b><span>可用 ' +
-        mb(v.avail_kb) + ' / 共 ' + mb(v.total_kb) + ' · 已用 ' + pct + '%</span></div>' +
-        '<div class="volbar"><i style="width:' + Math.min(100, pct) + '%"></i></div>' +
-        '<div class="voltop">' + tops + '</div>' +
-        '<div class="volnote">只读展示。这里是用户数据与系统模型，本工具不会删除；' +
-        '清理系统盘也不会释放这里的空间。</div></div>';
-    }).join('');
-  }
-
   /* ===== A3 历史趋势 / S5 上次结果与日志 ===== */
   function loadHistory() {
     fetch('/api/history', { cache: 'no-store' })
@@ -355,71 +330,6 @@
           bytesText(R.cache && R.cache.reclaimed_bytes) + '</b>';
       })
       .catch(function () { $('last-result').textContent = '上次执行结果读取失败。'; });
-  }
-
-  function loadLog() {
-    fetch('/api/log', { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
-      .then(function (D) {
-        $('full-log').textContent = D.log || '（无日志）';
-        var d = $('log-details');
-        d.hidden = false;
-        d.open = true;
-        var fold = $('fold-history');
-        if (fold) fold.open = true;   // 外层折叠也要展开，否则日志看不见
-      });
-  }
-
-  function copyDiag() {
-    var R = lastScan || {}, d = R.device || {}, sp = R.space || {}, b = R.bootloader || {};
-    var prof = (R.precheck || {}).profile || {};
-    var lines = [
-      '系统盘清理助手 · 诊断信息',
-      '时间: ' + (R.time || '-'),
-      '设备(hostname): ' + (d.hostname || '-'),
-      '机型(设备树): ' + (d.model_name || '未识别（设备未提供 /proc/device-tree/model）'),
-      '机型依据: board.model.id=' + (d.model_id || '-') +
-        ' / compatible=' + ((d.compat_items || []).join(',') || '-'),
-      'SoC 诊断标签: ' + (d.soc || '无（未做机型归类，识别字段不参与清理判断）'),
-      '架构: ' + (d.arch || '-'),
-      'fnOS: ' + (d.fnos || '-') + '  内核: ' + (d.kernel || '-'),
-      '系统盘可用: ' + mb(sp.root_before_kb) + '  /boot 可用: ' + mb(sp.boot_before_kb),
-      '实引导: ' + (b.real || '-') + ' → ' + (b.boot_kernel_path || '-'),
-      '引导版本解析: ' + (b.boot_version_parsed ? '成功' : '失败（清理会安全中止）'),
-      '实引导原始配置: ' + String(b.detail || '-').replace(/\s+/g, ' ').slice(0, 180),
-      '峰值阈值来源: ' + (prof.source || '-') + '（单台单次实测，其它机型仅供参考）',
-      'SSH: ' + ((R.ssh || {}).ok ? '已开启' : '未开启'),
-      '可清理旧内核: ' + ((R.purge_list || []).length) + ' 个包',
-      '清理项:'
-    ];
-    ((R.cache_items || [])).forEach(function (x) {
-      lines.push('  ' + x.name + ' = ' + x.size_str +
-        (x.actionable === false ? '（只读）' : ''));
-    });
-    var ta = document.createElement('textarea');
-    ta.value = lines.join('\n');
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.select();
-    try {
-      document.execCommand('copy');
-      pill('ok', '诊断信息已复制');
-    } catch (e) {
-      pill('warn', '复制失败');
-    }
-    document.body.removeChild(ta);
-    // v1.6.2：此前这里写死 pill('', '内核已是最新')，有旧内核时会误报"已是最新"。
-    // 恢复成与当前扫描一致的状态（同 renderScan 末尾口径）。
-    setTimeout(function () {
-      if (lastScan) {
-        var olds = (lastScan.kernels || []).filter(function (k) {
-          return k.action === 'remove';
-        });
-        var pl = lastScan.purge_list || [];
-        pill('', pl.length ? '发现 ' + olds.length + ' 个旧内核' : '内核已是最新');
-      }
-    }, 2500);
   }
 
   function renderBoot(R) {
@@ -603,7 +513,6 @@
         renderBreakdown(R);
         renderPrecheck(R);
         renderCronFix(R);
-        renderVolumes(R);
         loadHistory();
         loadLast();
         if (R.status === 'ERROR') renderResult(R);
@@ -720,14 +629,45 @@
     if (e.key === 'Escape') { qrClose(); cronClose(); }
   });
 
+  // v1.7 F1：安全自检（只读），逐项显示通过/未通过
+  function selfcheck() {
+    var btn = $('btn-selfcheck');
+    var card = $('selfcheck-card');
+    if (!btn || !card) return;
+    btn.disabled = true;
+    var old = btn.textContent;
+    btn.textContent = '自检中…';
+    card.hidden = false;
+    $('selfcheck-verdict').textContent = '正在只读检查（不改系统）…';
+    $('selfcheck-list').innerHTML = '';
+    fetch('/api/selfcheck', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        $('selfcheck-verdict').textContent = d.verdict || d.status_text || '—';
+        var rows = (d.checks || []).map(function (c) {
+          var color = c.ok ? 'var(--color-text-success, #1D9E75)' : 'var(--color-text-danger, #A32D2D)';
+          return '<div style="padding:6px 0;border-bottom:1px solid var(--color-border-tertiary)">' +
+            '<b style="color:' + color + '">' + (c.ok ? '✓' : '✗') + '</b> ' +
+            esc(c.name) + '<div class="sub">' + esc(c.detail || '') +
+            (c.hint ? ' ｜ ' + esc(c.hint) : '') + '</div></div>';
+        }).join('');
+        $('selfcheck-list').innerHTML = rows || '<p class="sub">没有检查项（' +
+          esc(d.status_text || '未知原因') + '）</p>';
+      })
+      .catch(function (e) {
+        $('selfcheck-verdict').textContent = '自检请求失败：' + e;
+      })
+      .finally(function () { btn.disabled = false; btn.textContent = old; });
+  }
+  $('btn-selfcheck').addEventListener('click', selfcheck);
   $('btn-scan').addEventListener('click', function () { scan(true); });
   $('btn-clean').addEventListener('click', clean);
-  $('btn-load-log').addEventListener('click', loadLog);
-  $('btn-copy-diag').addEventListener('click', copyDiag);
   // v1.6.2：统一用 fetch 等服务端采集真正完成（诊断要几十秒，早前 WebView 分支
   // 用 iframe + 固定 1.5s 定时器，采集没完就报"已发起下载"，是假成功）。
   // 拿到 blob 后：优先用系统分享（App WebView 里最可靠），否则 a.download；
-  // 都不支持则明确提示用"复制诊断信息"兜底，不再谎报成功。
+  // 都不支持则如实提示换浏览器打开再导出，不再谎报成功。
+  // v1.7：删掉"复制诊断信息"——完整诊断报告 8 万字符塞进剪贴板会被
+  // 微信/输入法截断，反而误事；导出诊断包才是唯一可靠通道。
   function inAppWebView() {
     var ua = navigator.userAgent || '';
     var standalone = (window.navigator.standalone === true ||
@@ -766,7 +706,7 @@
           return;
         }
         // WebView 既无分享也无下载能力：如实说明，给兜底路径
-        pill('warn', '诊断包已生成，但此 App 不支持直接保存；请用「复制诊断信息」发给作者');
+        pill('warn', '诊断包已生成，但此 App 不支持直接保存；请用浏览器打开本页再导出');
       })
       .catch(function (e) { pill('danger', '导出失败：' + String(e)); })
       .finally(function () { btn.disabled = false; });

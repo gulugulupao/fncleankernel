@@ -378,7 +378,7 @@ def base(mode):
         cache_items=[], selected=list(DEFAULT_ITEMS),
         cache=dict(results=[], reclaimed_bytes=0, failed=[]),
         breakdown=dict(rows=[], total_kb=0, used_kb=0, avail_kb=0),
-        volumes=[], precheck=dict(items=[], ok=False, advice='', note=''),
+        precheck=dict(items=[], ok=False, advice='', note=''),
         cron_source=[],
         warnings=[], notes=[], log=[], kernel_phase_status='')
 
@@ -464,7 +464,7 @@ def finish(R):
             _atomic_write(STATE, json.dumps(R, ensure_ascii=False, indent=2))
             _append_history(R)
             # 清理后空间构成已变，让下次 scan 重新统计
-            for k in ('cache_breakdown', 'cache_volumes'):
+            for k in ('cache_breakdown',):
                 try:
                     os.remove(os.path.join(VAR, k + '.json'))
                 except OSError:
@@ -1175,38 +1175,6 @@ def disk_breakdown():
                 total_kb=total, used_kb=used, avail_kb=avail)
 
 
-def volume_survey():
-    """只读：/vol* 数据卷占用与顶层大目录。绝不删除任何东西。"""
-    vols = []
-    for i in range(1, 11):
-        p = '/vol%d' % i
-        if not os.path.isdir(p):
-            continue
-        rc, out, err = sh(['df', '-k', p], timeout=30)
-        f = out.splitlines()[-1].split() if out.strip() else []
-        if len(f) < 4:
-            continue
-        try:
-            total, used, avail = int(f[1]), int(f[2]), int(f[3])
-        except ValueError:
-            continue
-        rc2, out2, _ = sh(['du', '-k', '--max-depth=1', p], timeout=180)
-        tops = []
-        for line in out2.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) == 2 and parts[1] != p:
-                try:
-                    tops.append(dict(path=parts[1], kb=int(parts[0])))
-                except ValueError:
-                    pass
-        tops.sort(key=lambda x: x['kb'], reverse=True)
-        vols.append(dict(mount=p, total_kb=total, used_kb=used,
-                         avail_kb=avail,
-                         pcent=(100 * used // total) if total else 0,
-                         top=tops[:8]))
-    return vols
-
-
 def precheck(R):
     """A2 更新前预检：阈值来自 2026-11-12 OEC 真机更新峰值实测。"""
     sp, bl = R['space'], R['bootloader']
@@ -1239,15 +1207,6 @@ def precheck(R):
     return dict(
         items=items, ok=ok,
         advice='静态检查通过，可以更新' if ok else '建议先清理再更新',
-        note='本阈值来自 OEC 单台单次更新实测（fnOS 1.2.1000 → 1.2.1010，'
-             '2 秒间隔采样 326 条），其它机型 / 更新包的峰值可能不同，仅供参考：'
-             '该次更新系统盘峰值额外占用 %s，'
-             '其中约 %s 为临时占用（/var/tmp 解压后回落）、约 %s 为持久占用；'
-             '峰值时刻可用一度只剩 %s。按峰值加余量给出 %.2f GB 建议线。'
-             '本项只按静态可用空间判断，不保证更新一定成功。'
-             % (human(UPDATE_PEAK_KB * 1024), human(UPDATE_TMP_KB * 1024),
-                human(UPDATE_NET_KB * 1024), human(UPDATE_MIN_AVAIL_KB * 1024),
-                UPDATE_SAFE_KB / 1048576.0),
         profile=dict(peak_kb=UPDATE_PEAK_KB, net_kb=UPDATE_NET_KB,
                      tmp_kb=UPDATE_TMP_KB, min_avail_kb=UPDATE_MIN_AVAIL_KB,
                      safe_kb=UPDATE_SAFE_KB,
@@ -1286,7 +1245,6 @@ def do_scan(force=False):
         # 「系统盘缓存扫描：…」那条 note 已删：与清理项卡片逐项重复。
         # A1 / A4 的 du 结果做 5 分钟缓存；A2 预检只用已核对的静态事实
         R['breakdown'] = _cached('cache_breakdown', 300, disk_breakdown, force=force)
-        R['volumes'] = _cached('cache_volumes', 300, volume_survey, force=force)
         R['precheck'] = precheck(R)
         R['status'] = 'SCAN'
     except Exception:
@@ -1340,6 +1298,22 @@ def do_clean(dry=False, items=None):
                 note(R, '未勾选旧内核清理，跳过内核卸载与引导断言；'
                         '仅处理勾选的系统盘缓存项。')
             return R
+
+        # 安全断言 A0（v1.7 F2）：dpkg 不能有半配置包。
+        # 现有断言查了内核包 / 实引导 / apt 预演，但没查 dpkg --audit。
+        # 半配置包(iF/iU)时 apt 操作可能失败或误判，此时动内核风险极高。
+        try:
+            _rc_audit, _out_audit, _ = sh(['dpkg', '--audit'], timeout=90)
+            if _out_audit.strip():
+                R['status'] = 'UNSAFE_PLAN'
+                note(R, 'UNSAFE_PLAN：检测到 dpkg 半配置包，apt 操作可能误判，'
+                        '请先修复 dpkg 状态再清理。dpkg --audit 输出：%s' %
+                     _out_audit.strip()[:400], 'warnings')
+                return R
+        except Exception:
+            # dpkg --audit 查询失败不阻断——它不是安全判断的唯一依据，
+            # 但若系统连 dpkg 都跑不了，后续 apt 阶段自然会失败并被捕获。
+            pass
 
         # 安全断言 A：当前运行内核必须有对应 dpkg 包
         if d['cur_pkg'] not in d['imgs']:
@@ -1518,8 +1492,66 @@ def do_clean(dry=False, items=None):
         else:
             R['grub'] = dict(executed=False, forced=False, rc=None, output='',
                              note='dry-run 不改动系统，故不执行')
+        # v1.7 F3：清理后回读验证——把"我以为删成功了"变成"我验证删成功了"。
+        # 只在真实执行（非 dry-run）时做，纯只读查询，绝不再改系统。
+        if not dry:
+            R['verify'] = _verify_after_clean(R)
         return finish(R)
     return R
+
+
+def _verify_after_clean(R):
+    """清理后回读：目标包是否真消失、保留内核是否仍在、grub.cfg 是否刷新。
+
+    v1.7 F3：对动内核/引导的工具，结果自证比"命令返回 0"更可信。
+    全程只读查询，任何失败都记 skipped/ERROR，不影响主流程。"""
+    v = dict(removed_absent=[], removed_still_present=[],
+             kept_missing=[], boot_freed_kb=None, grub_refreshed=None)
+    try:
+        removed = [p for p in (R.get('purge_list') or []) if p]
+        installed = dpkg_installed('linux-image-*')
+        for p in removed:
+            # 只认 linux-image 包的消失；headers 等同名核对意义不大
+            if p in installed:
+                v['removed_still_present'].append(p)
+            else:
+                v['removed_absent'].append(p)
+    except Exception as ex:
+        v['package_check'] = 'ERROR: %r' % ex
+    try:
+        installed = dpkg_installed('linux-image-*')
+        for p in (R.get('keep') or []):
+            if p and p not in installed:
+                v['kept_missing'].append(p)
+    except Exception as ex:
+        v['keep_check'] = 'ERROR: %r' % ex
+    try:
+        after = avail_kb('/boot')
+        before = R['space'].get('boot_before_kb')
+        if before and after is not None:
+            v['boot_freed_kb'] = max(0, before - after)
+    except Exception:
+        pass
+    try:
+        p = '/boot/grub/grub.cfg'
+        if os.path.exists(p):
+            mt = os.path.getmtime(p)
+            v['grub_mtime'] = datetime.fromtimestamp(mt).strftime('%Y-%m-%d %H:%M:%S')
+            v['grub_refreshed'] = bool(R.get('grub', {}).get('executed'))
+    except Exception:
+        pass
+    # 结论行：给前端和报告一句话摘要
+    if v['removed_still_present']:
+        v['verdict'] = 'PARTIAL：仍有目标包未删除'
+    elif v['kept_missing']:
+        v['verdict'] = 'WARN：保留内核缺失，请勿重启并人工核查'
+    elif R.get('status') == 'GRUB_FAILED':
+        v['verdict'] = 'GRUB_FAILED：包状态正常但引导刷新失败，勿重启'
+    elif R.get('status') in ('OK', 'NO_OLD_KERNEL'):
+        v['verdict'] = 'OK：回读通过'
+    else:
+        v['verdict'] = 'SKIP：本次未涉及内核删除，无需回读'
+    return v
 
 
 def _restore_unlocked(R):
@@ -1553,6 +1585,60 @@ def _restore_hold(R, d):
                 R['hold']['restored'].append(p)
     if R['hold']['restored']:
         note(R, '已恢复锁定：%s' % ', '.join(R['hold']['restored']))
+
+
+def do_selfcheck():
+    """v1.7 F1：只读安全自检——回答"升级 fnOS 后工具还能不能安全工作"。
+
+    复用 scan 用的同一批只读采集与安全断言，但：
+      - 不写 last_result.json / last_scan.json / history.jsonl / clean.log
+      - 不执行 apt 预演之外的任何写操作，不跑 update-grub
+      - 输出逐项 checks + 总体 verdict，前端可直接展示
+    """
+    checks = []
+
+    def add(name, ok, detail, hint=''):
+        checks.append(dict(name=name, ok=bool(ok),
+                           detail=str(detail)[:300], hint=hint))
+
+    d = collect()
+    cur = d.get('cur') or ''
+    add('当前内核有 dpkg 包', d.get('cur_pkg') in d.get('imgs', []),
+        '运行内核 %s / dpkg 包 %s' % (cur, d.get('cur_pkg') or '-'),
+        '缺包则无法确定保留边界')
+    bl = bootloader_info(set(d['keep_versions']))
+    add('实引导指向的内核文件存在', bl.get('boot_kernel_ok'),
+        '实引导 %s → %s' % (bl.get('real', '-'), bl.get('boot_kernel_path', '-')))
+    add('实引导未指向待删旧内核', not bl.get('boot_on_old'),
+        '引导版本 %s' % (bl.get('boot_version') or '-'),
+        '若指向旧内核，请先重启切到新内核')
+    add('能解析实引导内核版本', bl.get('boot_version_parsed'),
+        bl.get('boot_version') or '解析失败',
+        '无法解析时清理会 fail-closed 中止')
+    add('保留内核集合非空', bool(d['keep_pkgs']),
+        ', '.join(d['keep_pkgs']) or '无')
+    try:
+        rc, out, _ = sh(['dpkg', '--audit'], timeout=90)
+        add('dpkg 无半配置包', not out.strip(),
+            out.strip()[:200] or 'dpkg --audit 干净',
+            '有半配置包时先修复 dpkg 状态')
+    except Exception as ex:
+        add('dpkg 状态可查询', False, repr(ex))
+    _grub_exists = any(os.path.exists(p) for p in
+                       ('/usr/sbin/update-grub', '/usr/bin/update-grub'))
+    add('update-grub 命令存在', _grub_exists,
+        '/usr/sbin/update-grub %s' % ('存在' if _grub_exists else '不存在'))
+    root_avail = avail_kb('/')
+    add('系统盘可用空间充足', root_avail and root_avail > LOW_SPACE_KB,
+        '%d MB 可用（门槛 %d MB）' %
+        ((root_avail or 0) // 1024, LOW_SPACE_KB // 1024))
+
+    failed = [c for c in checks if not c['ok']]
+    return dict(mode='selfcheck', time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                device=host_info(), checks=checks,
+                verdict=('PASS：所有只读安全检查通过，可以执行清理' if not failed
+                         else 'BLOCK：%d 项检查未通过，清理会被安全中止' % len(failed)),
+                ok=not failed)
 
 
 def do_diagnose():
@@ -1703,6 +1789,66 @@ def do_diagnose():
         D['errors'].append('device-info: %r' % ex)
         D['device'] = {}
 
+    # 7e. v1.7：工具自身运行痕迹 —— 诊断"运行 fncleankernel 出错"的关键证据。
+    # 此前诊断包只收系统现场，工具自己的 clean.log / last_result / history
+    # 一个都没收，报"点清理没反应"时作者看不到工具到底干了什么。
+    def _tail(path, limit):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                return ''.join(f.readlines()[-limit:])
+        except FileNotFoundError:
+            return '(文件不存在)'
+        except Exception as ex:
+            return 'ERROR: %r' % ex
+
+    D['tool_clean_log'] = _tail(LOGFILE, 300)
+    D['tool_web_log'] = _tail(os.path.join(LOGDIR, 'web.log'), 100)
+    D['tool_history'] = _tail(HISTORY, 30)
+
+    # last_result 只提关键字段，不整份塞（9.8K 里大半是 device/space 等重复信息）
+    try:
+        with open(STATE, 'r', encoding='utf-8') as f:
+            last = json.load(f)
+        D['tool_last_result'] = {
+            k: last.get(k) for k in
+            ('status', 'status_text', 'mode', 'time',
+             'warnings', 'kernel_phase_status', 'selected', 'purge_list')
+            if k in last}
+        sp = last.get('space') or {}
+        gr = last.get('grub') or {}
+        D['tool_last_result']['space_reclaimed_kb'] = sp.get('reclaimed_kb')
+        D['tool_last_result']['grub_rc'] = gr.get('rc')
+    except FileNotFoundError:
+        D['tool_last_result'] = '(尚无清理记录)'
+    except Exception as ex:
+        D['tool_last_result'] = 'ERROR: %r' % ex
+
+    # 工具版本与运行环境。
+    # 飞牛安装后只保留 bin/config/ui/web，manifest 被应用中心收走——从磁盘读
+    # manifest 拿不到版本。前端 index.html 标题每次发版都同步（vX.Y.Z），
+    # 它才是运行时可靠来源；失败再退回 appcenter-cli。
+    _ver = '(未知)'
+    try:
+        _idx = read_file(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'web', 'index.html'), 8192)
+        _mv = re.search(r'v(\d+\.\d+\.\d+)', _idx)
+        if _mv:
+            _ver = _mv.group(1)
+    except Exception:
+        pass
+    if _ver == '(未知)':
+        try:
+            _rc, _out, _ = sh(['appcenter-cli', 'list'], timeout=30)
+            _mv = re.search(r'fncleankernel\s*│[^\n]*?│\s*([\d.]+)', _out)
+            if _mv:
+                _ver = _mv.group(1)
+        except Exception:
+            pass
+    D['tool_info'] = dict(
+        version=_ver, var=VAR, logdir=LOGDIR,
+        python=sh(['python3', '--version'])[1].strip() or '(未知)',
+        uid=sh(['id', '-un'])[1].strip() or '(未知)')
+
     # 8. 派生结论：野生内核目录（目录里有，dpkg 没登记，且不是当前运行内核）
     try:
         cur = _run(['uname', '-r']).split()[0]
@@ -1740,6 +1886,10 @@ def do_diagnose():
         return text
     for _k in list(D['sections']):
         D['sections'][_k] = _sanitize(str(D['sections'][_k]))
+    # v1.7：工具自身日志同样是文本，必须一起脱敏（clean.log 里可能出现 MAC/token）
+    for _k in ('tool_clean_log', 'tool_web_log', 'tool_history'):
+        if isinstance(D.get(_k), str):
+            D[_k] = _sanitize(D[_k])
 
     # 落一份 JSON 快照到本地 VAR（不写系统目录）
     try:
@@ -1763,6 +1913,11 @@ def main():
         D = do_diagnose()
         print(json.dumps(D, ensure_ascii=False, indent=2))
         return 0
+    if '--selfcheck' in args:
+        # v1.7 F1：只读安全自检，不写任何状态文件
+        S = do_selfcheck()
+        print(json.dumps(S, ensure_ascii=False, indent=2))
+        return 0 if S['ok'] else 3
     if '--fix-cron-mail' in args:
         # 独立操作：不写状态、不跑 grub，只处理 crontab，必须显式 --confirm
         R = do_fix_cron_mail(confirm=('--confirm' in args))

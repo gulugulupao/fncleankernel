@@ -126,6 +126,28 @@ STATIC = {
 }
 
 
+WEB_LOG = os.path.join(VAR, 'log', 'web.log')
+
+
+def _web_log(kind, detail):
+    """v1.7：Web 层异常落盘。此前 web.log 一直是 0 字节，报 500 / 引擎超时
+    时查不到任何线索。只记录异常，不记成功请求（避免噪音）。全程 try/except，
+    日志失败绝不影响主请求。"""
+    try:
+        line = '%s  %s  %s' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                              kind, _redact(str(detail))[:500])
+        with open(WEB_LOG, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+        # 简单轮转：超过 2000 行只留后 1000 行
+        with open(WEB_LOG, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+        if len(lines) > 2000:
+            with open(WEB_LOG, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines[-1000:]) + '\n')
+    except Exception:
+        pass
+
+
 def run_engine(args, timeout=1300):
     env = os.environ.copy()
     env.setdefault('TRIM_APPDEST', APP)
@@ -138,13 +160,17 @@ def run_engine(args, timeout=1300):
         try:
             return json.loads(out[out.find('{'):out.rfind('}') + 1])
         except Exception:
+            _web_log('ENGINE_PARSE_FAIL',
+                     'stderr=%s | stdout=%s' % ((p.stderr or '')[-400:], out[-400:]))
             return dict(status='ERROR', status_text='引擎输出解析失败',
                         warnings=[(p.stderr or '')[-800:], out[-800:]],
                         log=[], grub=dict(executed=False))
     except subprocess.TimeoutExpired:
+        _web_log('ENGINE_TIMEOUT', 'args=%s timeout=%s' % (args, timeout))
         return dict(status='ERROR', status_text='执行超时', warnings=['引擎执行超时'],
                     log=[], grub=dict(executed=False))
     except Exception as e:
+        _web_log('ENGINE_START_FAIL', repr(e))
         return dict(status='ERROR', status_text='引擎启动失败',
                     warnings=[repr(e)], log=[], grub=dict(executed=False))
 
@@ -373,6 +399,16 @@ class Handler(BaseHTTPRequestHandler):
                                        kernels=[], warnings=[], log=[]))
         if path_only == '/api/health':
             return self._json(dict(ok=True, app='fncleankernel', port=PORT))
+        if path_only == '/api/selfcheck':
+            # v1.7 F1：只读安全自检，独立于 scan 缓存，每次真跑
+            if not SCAN_BUSY.acquire(blocking=False):
+                return self._json(dict(ok=False, mode='selfcheck',
+                                       verdict='忙：请等上一次扫描/自检结束',
+                                       checks=[]), 429)
+            try:
+                return self._json(run_engine(['--selfcheck'], timeout=180))
+            finally:
+                SCAN_BUSY.release()
         if path_only == '/api/diagnose':
             return self._diagnose_zip()
         if path_only == '/api/log':
@@ -406,6 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         诊断本身可能较慢（du/dmesg/journalctl），最长 5 分钟。"""
         D = run_engine(['--diagnose'], timeout=300)
         if not isinstance(D, dict) or 'sections' not in D:
+            _web_log('DIAGNOSE_FAIL', str(D)[:500])
             return self._json(dict(error='诊断采集失败', raw=str(D)[:500]), 500)
         # v1.6.0：把 Web 层记录的"被拒写请求"并入诊断，事后可查
         # "谁在何时用什么 Host/Origin 被哪条规则挡下"。引擎看不到这些 403。
@@ -420,6 +457,12 @@ class Handler(BaseHTTPRequestHandler):
                          '生成时间: ' + str(D.get('time', '-')),
                          '说明: 全部为只读采集，未删除/修改任何系统文件。',
                          '']
+                # v1.7 P1-3：采集异常显式置顶，避免藏在报告末尾被忽略
+                if D.get('errors'):
+                    lines.append('⚠ 采集异常 %d 项（详见报告末尾「采集异常」节）：' %
+                                 len(D['errors']))
+                    lines.extend('  · ' + str(x) for x in D['errors'])
+                    lines.append('')
                 # v1.6.4：头部直接给出设备身份，不再需要从 uname 猜机型
                 dev = D.get('device') or {}
                 if dev:
@@ -479,9 +522,26 @@ class Handler(BaseHTTPRequestHandler):
                              'syslog_7d_keywords', 'lscpu', 'meminfo', 'zram_swap',
                              'thermal', 'cpu_freq', 'storage_devices', 'mmc_info',
                              'network', 'gpu_npu_nodes', 'loadavg_procs', 'time_sync']:
+                    if name == 'journal_err_7d':
+                        # v1.7 P1-2：明确告知截断，避免作者误以为"没错误"
+                        total = (secs.get('journal_7d_count') or '').strip()
+                        lines.append('===== 7 天日志说明 =====')
+                        lines.append('7 天日志总行数: %s 行；'
+                                     '下列错误/警告段各只取最近 300/150 行，'
+                                     '并非全量——若错误集中在更早时间，本包不含。'
+                                     % (total or '未知'))
+                        lines.append('')
                     lines.append('===== %s =====' % name)
                     lines.append(str(secs.get(name, '(空)')))
                     lines.append('')
+                # v1.7 P0：工具自身运行痕迹也写进人可读报告
+                for key in ('tool_info', 'tool_clean_log', 'tool_web_log',
+                            'tool_last_result', 'tool_history'):
+                    v = D.get(key)
+                    if v is not None:
+                        lines.append('===== %s =====' % key)
+                        lines.append(str(v))
+                        lines.append('')
                 if D.get('errors'):
                     lines.append('===== 采集异常 =====')
                     lines.extend(str(x) for x in D['errors'])
@@ -489,6 +549,7 @@ class Handler(BaseHTTPRequestHandler):
                 z.writestr('诊断数据.json',
                            json.dumps(D, ensure_ascii=False, indent=2).encode('utf-8'))
         except Exception as ex:
+            _web_log('ZIP_FAIL', repr(ex))
             return self._json(dict(error='打包失败', detail=repr(ex)), 500)
         data = buf.getvalue()
         # 固定文件名，避免中文/时间导致部分浏览器下载异常

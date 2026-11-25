@@ -336,6 +336,108 @@ def app_host_check():
     return dict(ok=ok, allow=[x[1] for x in allow], deny=[x[1] for x in deny])
 
 
+def v17_selfcheck_check():
+    """v1.7 F1：自检结构完整、只读、返回 verdict。"""
+    spec_s = importlib.util.spec_from_file_location('kc_sc', APP + '/bin/kernel_clean.py')
+    m = importlib.util.module_from_spec(spec_s)
+    spec_s.loader.exec_module(m)
+
+    def fake_sh(argv, timeout=30):
+        cmd = ' '.join(argv)
+        if 'dpkg' in cmd and '--audit' in cmd:
+            return 0, '', ''
+        if 'uname' in cmd:
+            return 0, '6.18.18.c1191-trim\n', ''
+        return 0, '', ''
+    m.sh = fake_sh
+    m.collect = lambda: dict(cur='6.18.18.c1191-trim',
+                             cur_pkg='linux-image-6.18.18.c1191-trim',
+                             imgs=['linux-image-6.18.18.c1191-trim'],
+                             keep_pkgs=['linux-image-6.18.18.c1191-trim'],
+                             keep_versions=['6.18.18.c1191-trim'])
+    m.bootloader_info = lambda k: dict(boot_kernel_ok=True, boot_on_old=False,
+                                       boot_version_parsed=True,
+                                       boot_version='6.18.18.c1191-trim',
+                                       real='u-boot', boot_kernel_path='/boot/Image')
+    m.host_info = lambda: dict(hostname='T', kernel='K', arch='arm64', fnos='1.2')
+    m.avail_kb = lambda p: 4_000_000
+    # 本机是 Windows，/usr/sbin/update-grub 不存在——临时 mock 成存在模拟真机
+    _orig_exists = os.path.exists
+    os.path.exists = lambda p: True if 'update-grub' in str(p) else _orig_exists(p)
+    try:
+        S = m.do_selfcheck()
+    finally:
+        os.path.exists = _orig_exists
+    ok = (S.get('ok') is True and len(S.get('checks', [])) >= 8 and
+          'PASS' in S.get('verdict', '') and
+          all(('ok' in c) for c in S.get('checks', [])))
+    return dict(ok=ok, verdict=S.get('verdict'), n=len(S.get('checks', [])))
+
+
+def v17_dpkg_guard_check():
+    """v1.7 F2：dpkg --audit 有输出 → UNSAFE_PLAN 且不动包。"""
+    spec_s = importlib.util.spec_from_file_location('kc_dg', APP + '/bin/kernel_clean.py')
+    m = importlib.util.module_from_spec(spec_s)
+    spec_s.loader.exec_module(m)
+    m.VAR = 'E:/WorkBuddy产物/2026-11-02-23-07-59/旧内核清理fpk/_testvar'
+    m.purge_calls = []
+
+    def fake_sh(argv, timeout=30):
+        cmd = ' '.join(argv)
+        if 'dpkg' in cmd and '--audit' in cmd:
+            return 0, 'iF  half-configured-package\n', ''
+        if 'apt-get' in cmd and 'purge' in cmd:
+            m.purge_calls.append(argv)
+        return 0, '', ''
+    m.sh = fake_sh
+    d = dict(cur='6.18.18.c1191-trim', cur_pkg='linux-image-6.18.18.c1191-trim',
+             imgs=['linux-image-6.18.18.c1191-trim', 'linux-image-6.18.18.c1145-trim'],
+             keep_pkgs=['linux-image-6.18.18.c1191-trim'],
+             keep_versions=['6.18.18.c1191-trim'],
+             candidates=['linux-image-6.18.18.c1145-trim'], purge=[],
+             extra_packages=[], meta=[], hold_installed=[], hold_to_unlock=[],
+             rows=[])
+    m.collect = lambda: d
+    m.bootloader_info = lambda k: dict(boot_kernel_ok=True, boot_on_old=False,
+                                       boot_version_parsed=True,
+                                       boot_version='6.18.18.c1191-trim')
+    m.host_info = lambda: {}
+    m.ssh_info = lambda: dict(ok=True, active=True, enabled=True, port22=True, hint='')
+    m.cache_scan = lambda: []
+    m.avail_kb = lambda p: 4_000_000
+    m.run_update_grub = lambda: (0, 'ok')  # 铁律段不该把守卫的 UNSAFE_PLAN 覆盖掉
+    R = m.do_clean(dry=False, items=['old_kernel'])
+    ok = (R.get('status') == 'UNSAFE_PLAN' and len(m.purge_calls) == 0 and
+          any('半配置' in str(w) for w in R.get('warnings', [])))
+    return dict(ok=ok, status=R.get('status'), purge_calls=len(m.purge_calls))
+
+
+def v17_verify_check():
+    """v1.7 F3：回读验证函数给出 verdict 与四字段。"""
+    spec_s = importlib.util.spec_from_file_location('kc_vf', APP + '/bin/kernel_clean.py')
+    m = importlib.util.module_from_spec(spec_s)
+    spec_s.loader.exec_module(m)
+    m.dpkg_installed = lambda pat: ['linux-image-6.18.18.c1191-trim']
+    m.avail_kb = lambda p: 2_000_000
+    _orig_exists = os.path.exists
+    os.path.exists = lambda p: True if 'grub.cfg' in str(p) else _orig_exists(p)
+    _orig_mtime = os.path.getmtime
+    os.path.getmtime = lambda p: 1700000000 if 'grub.cfg' in str(p) else _orig_mtime(p)
+    R = dict(purge_list=['linux-image-6.18.18.c1145-trim'],
+             keep=['linux-image-6.18.18.c1191-trim'],
+             space=dict(boot_before_kb=100_000),
+             status='OK', grub=dict(executed=True, rc=0))
+    try:
+        v = m._verify_after_clean(R)
+    finally:
+        os.path.exists = _orig_exists
+        os.path.getmtime = _orig_mtime
+    ok = (v.get('verdict', '').startswith('OK') and
+          v.get('removed_absent') == ['linux-image-6.18.18.c1145-trim'] and
+          v.get('kept_missing') == [] and v.get('grub_refreshed') is True)
+    return dict(ok=ok, verdict=v.get('verdict'), boot_freed_kb=v.get('boot_freed_kb'))
+
+
 def webview_origin_check():
     """v1.6.1：Android WebView 的 Origin:null 放行，攻击域名仍拒。"""
     import threading
@@ -587,13 +689,11 @@ def e3_force_scan_check():
     kc.cache_scan = lambda: []
     kc.cron_mail_source = lambda: []
     kc.disk_breakdown = lambda: dict(rows=[], total_kb=1, used_kb=1, avail_kb=0)
-    kc.volume_survey = lambda: []
     kc.precheck = lambda R: dict(items=[], ok=True, advice='', note='')
     kc.do_scan(force=True)
     kc._cached = orig
     return dict(seen=seen,
-                ok=(seen.get('cache_breakdown') is True and
-                    seen.get('cache_volumes') is True))
+                ok=(seen.get('cache_breakdown') is True))
 
 
 def main():
@@ -665,6 +765,9 @@ def main():
         ('v1.6.1 webview origin', webview_origin_check),
         ('v1.6.3 ssh port', ssh_port_check),
         ('v1.6.3 app host', app_host_check),
+        ('v1.7 F1 selfcheck', v17_selfcheck_check),
+        ('v1.7 F2 dpkg guard', v17_dpkg_guard_check),
+        ('v1.7 F3 verify', v17_verify_check),
     ]
     new_pass = 0
     for label, fn in new_checks:

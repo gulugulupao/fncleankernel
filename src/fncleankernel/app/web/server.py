@@ -420,6 +420,20 @@ class Handler(BaseHTTPRequestHandler):
                          '生成时间: ' + str(D.get('time', '-')),
                          '说明: 全部为只读采集，未删除/修改任何系统文件。',
                          '']
+                # v1.6.4：头部直接给出设备身份，不再需要从 uname 猜机型
+                dev = D.get('device') or {}
+                if dev:
+                    lines.append('===== 设备身份 =====')
+                    lines.append('机型: %s（ID: %s）' %
+                                 (dev.get('model_name') or '-',
+                                  dev.get('model_id') or '-'))
+                    lines.append('SoC: %s ｜ 架构: %s ｜ 飞牛版本: %s ｜ 内核: %s' %
+                                 (dev.get('soc') or '-', dev.get('arch') or '-',
+                                  dev.get('fnos') or '-', dev.get('kernel') or '-'))
+                    lines.append('hostname: %s ｜ compatible: %s' %
+                                 (dev.get('hostname') or '-',
+                                  ', '.join(dev.get('compat_items') or []) or '-'))
+                    lines.append('')
                 wild = D.get('wild_kernel_dirs') or []
                 lines.append('===== 关键结论 =====')
                 lines.append('当前运行内核: ' + str(D.get('current_kernel', '-')))
@@ -460,7 +474,11 @@ class Handler(BaseHTTPRequestHandler):
                              'df_k', 'df_inode', 'usr_top', 'var_top', 'usr_lib_top',
                              'big_files', 'app_big_logs', 'modules_dirs', 'modules_list', 'src_dirs',
                              'boot_files', 'dpkg_kernels', 'apt_hold', 'apt_cache',
-                             'bootloader', 'journal_err', 'dmesg_tail', 'syslog_tail']:
+                             'bootloader', 'journal_err', 'dmesg_tail', 'syslog_tail',
+                             'journal_err_7d', 'journal_warn_7d', 'journal_7d_count',
+                             'syslog_7d_keywords', 'lscpu', 'meminfo', 'zram_swap',
+                             'thermal', 'cpu_freq', 'storage_devices', 'mmc_info',
+                             'network', 'gpu_npu_nodes', 'loadavg_procs', 'time_sync']:
                     lines.append('===== %s =====' % name)
                     lines.append(str(secs.get(name, '(空)')))
                     lines.append('')

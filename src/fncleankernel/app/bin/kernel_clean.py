@@ -1636,6 +1636,73 @@ def do_diagnose():
     sec('dmesg_tail', ['sh', '-c', 'dmesg 2>/dev/null | tail -80'])
     sec('syslog_tail', ['sh', '-c', 'tail -120 /var/log/syslog 2>/dev/null'])
 
+    # 7b. v1.6.4：7 天日志窗口（此前只有尾部 N 行，无法回溯偶发问题）。
+    # 为控制诊断包体积与耗时，错误/警告级都限量取尾部，不做全量。
+    sec('journal_err_7d', ['sh', '-c',
+                           'journalctl --since "7 days ago" -p err --no-pager '
+                           '2>/dev/null | tail -300'])
+    # 注意：-p warning 语义是「warning 及以上」，会把 err 也带进来导致与
+    # journal_err_7d 完全重复；用 warning..warning 精确只取警告级。
+    sec('journal_warn_7d', ['sh', '-c',
+                            'journalctl --since "7 days ago" -p warning..warning '
+                            '--no-pager 2>/dev/null | tail -150'])
+    sec('journal_7d_count', ['sh', '-c',
+                             'journalctl --since "7 days ago" --no-pager '
+                             '2>/dev/null | wc -l'])
+    sec('syslog_7d_keywords', ['sh', '-c',
+                               'grep -aEi "oom|out of memory|segfault|panic|'
+                               'I/O error|ext4-fs error|watchdog|thermal|throttl|'
+                               'failed|error" /var/log/syslog 2>/dev/null | tail -150'])
+
+    # 7c. v1.6.4：硬件与设备参数（此前只有架构/分区，缺 CPU/内存/SoC/温度）
+    sec('lscpu', ['sh', '-c',
+                  'lscpu 2>/dev/null | grep -E "Architecture|Model name|Model|'
+                  'Vendor|CPU\\(s\\)|Thread|Core|Socket|MHz|Cache" | head -30'])
+    sec('meminfo', ['sh', '-c',
+                    'free -h 2>/dev/null; echo ---; '
+                    'grep -E "MemTotal|MemAvailable|SwapTotal|SwapFree" '
+                    '/proc/meminfo 2>/dev/null'])
+    sec('zram_swap', ['sh', '-c',
+                      'cat /proc/swaps 2>/dev/null; echo ---; '
+                      'cat /sys/block/zram0/disksize 2>/dev/null || true'])
+    sec('thermal', ['sh', '-c',
+                    'for t in /sys/class/thermal/thermal_zone*/temp; do '
+                    '[ -f "$t" ] && echo "$(basename $(dirname $t)): '
+                    '$(( $(cat $t 2>/dev/null) / 1000 ))C"; done 2>/dev/null | head -20'])
+    sec('cpu_freq', ['sh', '-c',
+                     'for f in /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq '
+                     '/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq; do '
+                     '[ -f "$f" ] && echo "$(basename $f): $(cat $f) kHz"; done'])
+    sec('storage_devices', ['sh', '-c',
+                            'lsblk -d -o NAME,TYPE,SIZE,MODEL,ROTA 2>/dev/null | head -20; '
+                            'echo ---; cat /proc/partitions 2>/dev/null | head -20'])
+    sec('mmc_info', ['sh', '-c',
+                     'cat /sys/block/mmcblk0/device/name '
+                     '/sys/block/mmcblk1/device/name 2>/dev/null; '
+                     'echo ---; cat /sys/block/mmcblk0/device/manfid '
+                     '/sys/block/mmcblk1/device/manfid 2>/dev/null'])
+    sec('network', ['sh', '-c',
+                    'ip -br addr 2>/dev/null | head -15; echo ---; '
+                    'ip route 2>/dev/null | head -10'])
+    sec('gpu_npu_nodes', ['sh', '-c',
+                          'ls -l /dev/dri /dev/mali0 /dev/galcore 2>/dev/null; '
+                          'echo ---; lsmod 2>/dev/null | grep -iE '
+                          '"panfrost|mali|galcore|amvdec|rknpu" | head -25'])
+    sec('loadavg_procs', ['sh', '-c',
+                          'cat /proc/loadavg 2>/dev/null; echo ---; '
+                          'ps aux --sort=-%cpu 2>/dev/null | head -12'])
+    sec('time_sync', ['sh', '-c',
+                      'date; echo ---; timedatectl 2>/dev/null | head -8; '
+                      'echo ---; cat /etc/timezone 2>/dev/null'])
+
+    # 7d. 结构化硬件字段：直接复用现成的 host_info()（机型/SoC/compatible 已验证），
+    # 不靠字符串解析日志。注意这些字段只用于诊断展示，不参与任何清理判断。
+    try:
+        D['device'] = host_info()
+    except Exception as ex:
+        D['errors'].append('device-info: %r' % ex)
+        D['device'] = {}
+
     # 8. 派生结论：野生内核目录（目录里有，dpkg 没登记，且不是当前运行内核）
     try:
         cur = _run(['uname', '-r']).split()[0]
@@ -1667,6 +1734,9 @@ def do_diagnose():
                       r'\1=<已脱敏>', text)
         text = re.sub(r'(?i)(Authorization\s*:\s*)\S+\s+\S+', r'\1<已脱敏>', text)
         text = re.sub(r'([A-Za-z0-9+/]{40,}={0,2})', '<长串已脱敏>', text)
+        # v1.6.4：MAC 地址对排查本工具问题无用，且是可识别设备的硬件标识，
+        # 脱敏掉。IP 保留——access_log 的来源 IP 与 network 节是排障必需。
+        text = re.sub(r'\b([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b', '<MAC已脱敏>', text)
         return text
     for _k in list(D['sections']):
         D['sections'][_k] = _sanitize(str(D['sections'][_k]))

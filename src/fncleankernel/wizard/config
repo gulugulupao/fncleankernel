@@ -1,0 +1,41 @@
+[
+  {
+    "stepTitle": "访问安全设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "仅在通过办公平台/反向代理打开本应用、出现「Host 或 Origin 不在允许列表」时才需要填写。局域网 IP、飞牛 FN Connect（*.fnos.net）已默认放行，无需设置。此表单在飞牛应用中心「设置」中打开，需登录飞牛账号，可安全信任。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_trusted_origins",
+        "label": "可信入口域名（多个用英文逗号分隔）",
+        "initValue": "",
+        "rules": []
+      },
+      {
+        "type": "tips",
+        "helpText": "示例：office.app.5ddd.com  或  office.example.com,*.corp.example.com。只填域名，不要带 https:// 和端口。支持 *.example.com 通配子域。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_security_mode",
+        "label": "校验模式",
+        "initValue": "default",
+        "options": [
+          { "label": "默认（推荐，安全）", "value": "default" },
+          { "label": "宽松（自建 DDNS 免登记，放弃 rebinding 防护）", "value": "loose" },
+          { "label": "严格（所有域名都要登记）", "value": "strict" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "默认：IP 直连 / 飞牛官方域 / 上方登记的域名放行。宽松：任意同源域名都放行（含自建 DDNS），但恶意站点可能借 DNS rebinding 调用清理接口，仅在你确认网络安全时选。严格：连自建 DDNS 也必须登记。"
+      },
+      {
+        "type": "tips",
+        "helpText": "保存后请到应用中心「重启」本应用使设置生效。"
+      }
+    ]
+  }
+]

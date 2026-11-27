@@ -62,6 +62,78 @@ _ALLOWED_HOSTS_EXTRA = set(
     x.strip().lower() for x in
     os.environ.get('FNCLEAN_ALLOWED_HOSTS', '').split(',') if x.strip())
 
+# v1.7.2：反向代理 / 办公平台内嵌场景的可信 Origin。
+# 场景：页面在 https://office.example.com 下，反代到 NAS 的 http://192.168.x.x:8097，
+# 浏览器发出的 Host 是 NAS IP（可信），但 Origin 是入口域名（原本不在白名单，被拒）。
+# 由部署者在应用环境变量里显式登记入口域名，多个用逗号分隔，支持精确域名与
+# *.example.com 后缀。不默认放行任意域名——否则任何站点都能诱导用户点清理，
+# 那才是真的安全漏洞。Host 必须可信这道防线始终保留。
+_ALLOWED_ORIGINS_EXTRA = set(
+    x.strip().lower() for x in
+    os.environ.get('FNCLEAN_ALLOWED_ORIGINS', '').split(',') if x.strip())
+
+
+# v1.7.2：settings.json 由应用中心「设置」页（wizard/config）写入。
+# 用 mtime 检测变化热重载——用户在应用中心点保存后无需重启即生效。
+_SETTINGS = {'origins': set(_ALLOWED_ORIGINS_EXTRA), 'mode': '', 'mtime': None}
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_FILE = os.path.join(VAR, 'trusted_origins.txt')
+_MODE_FILE = os.path.join(VAR, 'security_mode')
+
+
+def _reload_settings_if_changed():
+    """每次写请求校验时调用：文件 mtime 变了就重载，避免重启应用。"""
+    try:
+        stamps = []
+        for p in (_SETTINGS_FILE, _MODE_FILE):
+            try:
+                stamps.append(os.path.getmtime(p))
+            except OSError:
+                stamps.append(None)
+        with _SETTINGS_LOCK:
+            if stamps == _SETTINGS['mtime']:
+                return
+            origins = set(_ALLOWED_ORIGINS_EXTRA)   # 环境变量基线始终保留
+            try:
+                with open(_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.split('#', 1)[0].strip().lower()
+                        if line and '://' not in line:
+                            origins.add(line)
+            except (IOError, OSError):
+                pass
+            mode = ''
+            try:
+                with open(_MODE_FILE, 'r', encoding='utf-8') as f:
+                    candidate = f.read().strip().lower()
+                if candidate in ('loose', 'strict'):
+                    mode = candidate
+            except (IOError, OSError):
+                pass
+            _SETTINGS['origins'] = origins
+            _SETTINGS['mode'] = mode
+            _SETTINGS['mtime'] = stamps
+    except Exception:
+        pass    # 配置重载失败绝不影响主请求，按上次的有效配置继续
+
+
+_reload_settings_if_changed()
+
+
+def _trusted_origin(value):
+    """Origin 可信判定：先走 Host 那套规则，再叠加显式登记的入口域名。"""
+    if _trusted_host(value):
+        return True
+    h = _host_of(value)
+    if not h:
+        return False
+    for entry in _SETTINGS['origins']:
+        if entry.startswith('*.') and h.endswith(entry[1:]):
+            return True
+        if h == entry:
+            return True
+    return False
+
 # v1.5.8：飞牛官方域名后缀默认可信。FN Connect 远程访问的地址是
 # <FN ID>.fnos.net / appXXX.fnos.net（官方帮助中心与论坛实际用法），
 # 官方主站/论坛/帮助为 fnnas.com 及其子域。此前 Host 白名单只认本机名/IP，
@@ -305,36 +377,54 @@ class Handler(BaseHTTPRequestHandler):
         return ok, why
 
     def _write_check(self):
+        _reload_settings_if_changed()
         if (self.headers.get('X-Fnclean-Client') or '') != 'web':
             return False, '缺少同源标记（X-Fnclean-Client）'
         sec = (self.headers.get('Sec-Fetch-Site') or '').lower()
         if sec and sec not in ('same-origin', 'none'):
             return False, '跨站请求被拒绝（Sec-Fetch-Site=%s）' % sec
-        origin = self.headers.get('Origin')
-        # v1.6.3：Host / Origin 白名单的正确定位是「挡 DNS rebinding」，即恶意
-        # 站点把域名解析到 NAS 内网 IP 后诱导浏览器发请求——那种请求的 Origin
-        # 一定是攻击者的真实域名（evil.example）。而飞牛 App 内置浏览器（Android
-        # WebView）从本地/私有上下文加载页面时，Origin 是 null 或干脆不发，Host
-        # 也可能是 App 私有入口——它不是攻击，却会因 Host 白名单被误拒（截图
-        # 「Host 不在允许列表」）。
-        #
-        # 判定：前两道（X-Fnclean-Client 自定义头 + Sec-Fetch-Site 非跨站）已挡住
-        # 跨站攻击；这里只需拦「明确带恶意 Origin」的情况。App WebView 特征：
-        # Origin 缺失或为 null；此时即便 Host 不是标准地址也放行。
-        app_context = (not origin) or (origin.strip().lower() == 'null')
+
+        origin = (self.headers.get('Origin') or '').strip().lower()
         host = self.headers.get('Host') or ''
-        if origin:
-            if origin.strip().lower() != 'null' and not _trusted_host(origin):
-                return False, 'Origin 不在允许列表'
-            if origin.strip().lower() != 'null' and sec != 'same-origin':
-                oh = _host_of(origin)
-                hh = _host_of(host)
-                if oh and hh and oh != hh:
-                    return False, 'Origin 与 Host 不一致'
-        # 只有「非 App 上下文」（带可信真实 Origin 的普通浏览器）才严格要求
-        # Host 也在白名单；App WebView（无 Origin / null）跳过 Host 校验。
+        app_context = (not origin) or (origin == 'null')
+        oh = _host_of(origin) if origin and origin != 'null' else ''
+        hh = _host_of(host)
+        # same_origin：浏览器直接访问 NAS（IP / DDNS / FN Connect / 本机名），
+        # Host 与 Origin 指向同一个域。这是绝大多数正常入口。
+        same_origin = bool(oh and hh and oh == hh)
+        # 严格模式：FNCLEAN_STRICT_ORIGIN=1 时恢复「所有域名都要登记」的旧行为。
+        # 普通用户不必开——代价是自建 DDNS 也要手工登记。
+        strict = (os.environ.get('FNCLEAN_STRICT_ORIGIN') == '1' or
+                  _SETTINGS['mode'] == 'strict')
+
+        # v1.7.2：默认放行「同源且 Host 是 IP 字面量」的直连请求（局域网 / DDNS
+        # 解析到 IP 后直连的常见入口，零配置）。带名称的域名（无论是否同源）
+        # 仍走可信判定——因为 DNS rebinding 攻击恰好也是「Host==Origin」（两者
+        # 都是 evil.example），只看同源会把它一起放行，这是真实漏洞。
+        #
+        # 入口分类：
+        # - 本机 IP / 回环 / IP 字面量：一律可信（直连）
+        # - FN Connect 官方域 / 已登记域名：可信
+        # - 自建 DDNS 域名：需在 trusted_origins.txt 登记（或开宽松模式）
+        # - 反代场景 Host≠Origin：Origin 必须登记
+        #
+        # 宽松模式 FNCLEAN_LOOSE_ORIGIN=1：放宽到「同源即放行」，覆盖自建 DDNS
+        # 零配置，但放弃 rebinding 防护——只在可信网络环境下使用。
+        loose = (os.environ.get('FNCLEAN_LOOSE_ORIGIN') == '1' or
+                 _SETTINGS['mode'] == 'loose')
+
+        if origin and origin != 'null':
+            origin_ok = _trusted_origin(origin)
+            if loose and same_origin:
+                origin_ok = True   # 宽松模式：同源即放行，放弃 rebinding 防护
+            if not origin_ok:
+                return False, 'Origin 不在允许列表（严格模式）' if strict \
+                              else 'Origin 不在允许列表'
+
         if not app_context and host and not _trusted_host(host):
-            return False, 'Host 不在允许列表'
+            # 走到这：Host 带名称且不在白名单。只有宽松模式 + 同源才放行。
+            if not (loose and same_origin):
+                return False, 'Host 不在允许列表'
         return True, ''
 
     def _get_allowed(self):

@@ -1,5 +1,5 @@
 appname               = fncleankernel
-version               = 1.7.1
+version               = 1.7.2
 display_name          = 系统盘清理助手
 desc                  = 通用 ARM 飞牛 · 系统盘体检 + 逐项清理，给板载 EMMC 腾空间。<br><br>1.体检先行：空间构成条一眼看清 /usr 占了多少；更新前预检基于 OEC 真机实测的系统更新峰值（额外占用 1.11 GB）给出 1.29 GB 建议线；存储空间只读体检展示数据卷占用。<br>2.逐项勾选：旧内核、apt 缓存、日志轮转（含子目录）、活跃日志强制轮转、Cron 告警邮件，扫描时显示真机实测大小；中风险项需二次确认。<br>3.只清系统盘：清理项都作用于 / 所在文件系统，绝不碰数据卷；journal 实测在 tmpfs 内存盘，只作体检提示。<br>4.历史可查：每次清理落一条记录，趋势图 + 上次结果 + 完整日志 + 一键复制诊断信息。<br>5.引导刷新：涉及旧内核包变更时，无论清理成功 / 失败 / 无旧内核 / 内核被锁定，最后都强制执行 sudo update-grub；只清缓存时不触碰引导，自动跳过。<br><br>安全边界：保留当前内核与最新内核、hold 临时解锁与恢复、apt 预演白名单、u-boot 实引导断言全部保留。适用：网心云 OEC(RK3566) / OES(A311D) 等 ARM 版飞牛 fnOS。与飞牛官方无关。
 source                = thirdparty
@@ -12,4 +12,4 @@ desktop_applaunchname = fncleankernel.Application
 service_port          = 8097
 checkport             = true
 ctl_stop              = true
-changelog             = ★★ v1.7.1：修复安卓飞牛 App 内置浏览器导出诊断包失败。① 导出诊断包改为直接走 /api/diagnose 附件链接（原 fetch→blob→a.click 被 App WebView 拦截 blob:，实测弹「下载失败」）；② 删掉靠 UA 猜环境的 inAppWebView 判定，避免安卓夸克/QQ/飞牛 App 被误判成 App 内 WebView；③ 新增浏览器能力自检页 /compat.html（20 项检测，按环境给出导出路径结论）；④ 确认 Host/Origin 白名单对飞牛 App 各类请求头均放行（v1.6.3 已修，本版纳入验证）。【以下为历史变更】
+changelog             = v1.7.2：访问来源可配置。新增飞牛应用中心「设置」页表单，可自行登记可信入口域名（办公平台反代 / 自建 DDNS），保存即生效无需重启；Host/Origin 校验改为三档：默认（IP直连·FN Connect·已登记域名放行，挡DNS rebinding）、宽松（同源即放行，DDNS免登记）、严格（全部要登记）。修复办公平台反代场景「Origin 不在允许列表」误拒。【以下为历史变更】

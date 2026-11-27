@@ -1,3 +1,33 @@
 #!/bin/bash
-### Called after the user changes environment variables in the application settings.
+# 应用中心「设置」保存后触发：把向导填的可信域名 / 安全模式写入 appdata，
+# 由 web/server.py 启动时读取。这是可信路径（需登录飞牛账号进应用中心），
+# 与「被拒绝的 Origin 自己给自己放行」有本质区别。
+set +e
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fncleankernel}"
+mkdir -p "$VAR" 2>/dev/null
+
+# 可信域名：逗号 / 空白 / 换行分隔，逐行写入，过滤掉协议和端口
+ORIGINS_FILE="$VAR/trusted_origins.txt"
+if [ -n "$wizard_trusted_origins" ]; then
+  printf '%s' "$wizard_trusted_origins" | tr ',; \t' '\n' | \
+    sed -e 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' -e 's#[:/].*$##' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | \
+    grep -v '^$' | grep -v '^#' > "$ORIGINS_FILE.tmp" 2>/dev/null
+  if [ -f "$ORIGINS_FILE.tmp" ]; then
+    mv -f "$ORIGINS_FILE.tmp" "$ORIGINS_FILE" 2>/dev/null
+  fi
+else
+  : > "$ORIGINS_FILE" 2>/dev/null
+fi
+chmod 600 "$ORIGINS_FILE" 2>/dev/null
+
+# 安全模式：default 表示删除文件（回到默认安全档）
+MODE_FILE="$VAR/security_mode"
+case "$wizard_security_mode" in
+  loose|strict) printf '%s\n' "$wizard_security_mode" > "$MODE_FILE" 2>/dev/null ;;
+  *)            rm -f "$MODE_FILE" 2>/dev/null ;;
+esac
+chmod 600 "$MODE_FILE" 2>/dev/null
+
+echo "[fncleankernel] config saved: mode=$wizard_security_mode origins=$wizard_trusted_origins" \
+  >> "$VAR/log/install.log" 2>&1
 exit 0
